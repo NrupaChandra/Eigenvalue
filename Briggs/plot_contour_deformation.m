@@ -1,34 +1,3 @@
-%% Load JSON
-function data = read_contour_integration_json(filename)
-    raw = fileread(filename);
-    jsonData = jsondecode(raw);
-    numIterations = length(jsonData);
-    data(numIterations) = struct( ...
-        'iteration', [], ...
-        'F', [], ...
-        'L', [], ...
-        'omega_F', [], ...
-        'alpha_L_u', [], ...
-        'alpha_L_l', [] ...
-    );
-    for k = 1:numIterations-1
-        entry = jsonData(k);
-        data(k).iteration = entry.iteration;
-        data(k).F         = reim_to_complex(entry.F);
-        data(k).L         = reim_to_complex(entry.L);
-        data(k).omega_F   = reim_to_complex(entry.omega_F);
-        data(k).alpha_L_u = reim_to_complex(entry.alpha_L_u);
-        data(k).alpha_L_l = reim_to_complex(entry.alpha_L_l);
-    end
-end
-
-function cvec = reim_to_complex(reimArray)
-    n = length(reimArray);
-    cvec = complex(zeros(1, n));
-    for i = 1:n
-        cvec(i) = complex(reimArray(i).re, reimArray(i).im);
-    end
-end
 
 data = read_contour_integration_json('contour_iteration.json');
 
@@ -67,6 +36,42 @@ omega_xlim = omega_xlim + margin * diff(omega_xlim) * [-1, 1];
 omega_ylim = omega_ylim + margin * diff(omega_ylim) * [-1, 1];
 alpha_xlim = alpha_xlim + margin * diff(alpha_xlim) * [-1, 1];
 alpha_ylim = alpha_ylim + margin * diff(alpha_ylim) * [-1, 1];
+
+
+make_contour_video('contour_iteration.json', 'contour_video.mp4', omega_xlim, omega_ylim, alpha_xlim, alpha_ylim)
+
+%% Load JSON
+function data = read_contour_integration_json(filename)
+    raw = fileread(filename);
+    jsonData = jsondecode(raw);
+    numIterations = length(jsonData);
+    data(numIterations) = struct( ...
+        'iteration', [], ...
+        'F', [], ...
+        'L', [], ...
+        'omega_F', [], ...
+        'alpha_L_u', [], ...
+        'alpha_L_l', [] ...
+    );
+    for k = 1:numIterations-1
+        entry = jsonData(k);
+        data(k).iteration = entry.iteration;
+        data(k).F         = reim_to_complex(entry.F);
+        data(k).L         = reim_to_complex(entry.L);
+        data(k).omega_F   = reim_to_complex(entry.omega_F);
+        data(k).alpha_L_u = reim_to_complex(entry.alpha_L_u);
+        data(k).alpha_L_l = reim_to_complex(entry.alpha_L_l);
+    end
+end
+
+function cvec = reim_to_complex(reimArray)
+    n = length(reimArray);
+    cvec = complex(zeros(1, n));
+    for i = 1:n
+        cvec(i) = complex(reimArray(i).re, reimArray(i).im);
+    end
+end
+
 
 function make_contour_video(jsonfile, outputfile, omega_xlim, omega_ylim, alpha_xlim, alpha_ylim)
     data = read_contour_integration_json(jsonfile);
@@ -131,7 +136,8 @@ function plot_temporal(ax, L, omega_F, xlimits, ylimits)
     xlabel('\omega_r'); ylabel('\omega_i');
     title('\omega-plane');
     legend show;
-    axis equal;
+    axis normal;
+    %axis equal;
     xlim(xlimits);
     ylim(ylimits);
 end
@@ -145,9 +151,8 @@ function plot_spatial(ax, F, alphaU, alphaL, xlimits, ylimits)
     xlabel('\alpha_r'); ylabel('\alpha_i');
     title('\alpha-plane');
     legend show;
-    axis equal;
+    axis normal;
+    %axis equal;
     xlim(xlimits);
     ylim(ylimits);
 end
-
-make_contour_video('contour_iteration.json', 'contour_video.mp4', omega_xlim, omega_ylim, alpha_xlim, alpha_ylim)
