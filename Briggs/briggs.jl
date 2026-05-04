@@ -1,7 +1,7 @@
 # Kilian Vinzenz Wilhelm
 begin
     using Distributed, Plots, BenchmarkTools, FFTW, JSON
-    addprocs(32)
+    addprocs(4)
     w = workers()
 end
 begin
@@ -92,27 +92,32 @@ end
 # CONTOURS #
 ############
 begin
-    function load_on_workers()
-        names = (:L, :F, :omega_F, :alpha_L_u, :alpha_L_l)
-        for pid in workers()
-            for name in names
-                if isdefined(Main, name)
-                    data = deepcopy(getfield(Main, name))
-                    fetch(@spawnat pid Core.eval(Main, :($name = $data)))
-                end
-            end
-        end
-        return nothing
-    end
+    global L = ComplexF64[]
+    global F = ComplexF64[]
+    global omega_F = ComplexF64[]
+    global alpha_L_u = ComplexF64[]
+    global alpha_L_l = ComplexF64[]
+
     #=function load_on_workers()
         for (name, data) in [(:L, L), (:F, F), (:omega_F, omega_F), (:alpha_L_u, alpha_L_u), (:alpha_L_l, alpha_L_l)]
             for pid in workers()
-                @spawnat pid eval(Main, :($name = $(deepcopy(data))))
-                @spawnat pid L, F, omega_F, alpha_L_u, alpha_L_l
+                @spawnat pid Core.eval(Main, :($name = $(deepcopy(data)))) #use Core.eval(...) insted of eval(...)
+                #@spawnat pid L, F, omega_F, alpha_L_u, alpha_L_l  # this line causing problems
             end
         end
-        @everywhere L, F, omega_F, alpha_L_u, alpha_L_l
+       # @everywhere L, F, omega_F, alpha_L_u, alpha_L_l #this too, they do not properly sync variables.
     end=#
+  
+    function load_on_workers()
+        @sync begin
+            for (name, data) in [(:L, L), (:F, F), (:omega_F, omega_F), (:alpha_L_u, alpha_L_u), (:alpha_L_l, alpha_L_l)]
+                for pid in workers()
+                    @async remotecall_wait(Core.eval, pid, Main, :($name = $(deepcopy(data))))
+                end
+            end
+        end
+    end
+
     # ALPHA contour: F
     @everywhere begin
         alpha_r_start = 0.0
@@ -125,8 +130,7 @@ begin
         F = [alpha_r[j] + alpha_i[j] * im for j in 1:N]
         return F
     end
-   #@everywhere F = Vector{Complex{Float64}}[]
-    @everywhere F = ComplexF64[]
+    @everywhere F = Vector{Complex{Float64}}[]
     F = contour_F()
     @everywhere function couetteflow_temporal_sing_mode(alpha)
         #eigvals = couetteflow_temporal(alpha)
@@ -166,18 +170,14 @@ begin
         L = Complex{Float64}[omega_r[j] + omega_i * im for j in 1:N]
         return L 
     end
-    #@everywhere L = Vector{Complex{Float64}}[]
-    @everywhere L = ComplexF64[]
+    @everywhere L = Vector{Complex{Float64}}[]
     L = contour_L()
-    #=
+    #
     @everywhere begin
         alpha_L_u = Vector{Complex{Float64}}[]
         alpha_L_l = Vector{Complex{Float64}}[]
-    end=#
-    @everywhere begin
-    alpha_L_u = ComplexF64[]
-    alpha_L_l = ComplexF64[]
     end
+    #
     load_on_workers()
     @everywhere function contour_normals(F)
         normals = Complex{Float64}[]
@@ -586,115 +586,180 @@ begin
         write(file, JSON.json(current_array))
     end
     iteration_step += 1
+
 end
+function branch_distance(alpha_L_u, alpha_L_l)
+    return minimum(abs.(alpha_L_u .- alpha_L_l))
+end
+
+function local_contour_distances(F, alpha_L_u, alpha_L_l)
+    all_branches = vcat(alpha_L_u, alpha_L_l)
+    return [minimum(abs.(f .- all_branches)) for f in F]
+end
+
+function contour_distance(F, alpha_L_u, alpha_L_l)
+    return minimum(local_contour_distances(F, alpha_L_u, alpha_L_l))
+end
+
 #
-for k = 1:200
-    # state variables that must update the globals
-    global omega_i, L, alpha_L_u, alpha_L_l, alpha_i, F, omega_F, iteration_step, zeta_alpha
-
-    omega_i_vectorization = fill(omega_i, N)
-    omega_i_cache = copy(omega_i_vectorization)
-
-    println(zeta_omega)
-
-    for j in 2:(length(omega_i_cache) - 1)
-        omega_i_cache[j] = omega_i_vectorization[j] + delta_t * (
-            -lambda
-            + (omega_i_vectorization[j+1] - omega_i_vectorization[j-1]) /
-              (omega_r[j+1] - omega_r[j-1]) * d_d_omega_r_Phi_L(L[j])
-            - d_d_omega_i_Phi_L(L[j])
-        )
-    end
-
-    omega_ref = maximum(imag.(omega_F))
-    greater_candidates = filter(x -> x > omega_ref, omega_i_cache)
-
-    if isempty(greater_candidates)
-        omega_i = maximum(omega_i_cache)
-    else
-        omega_i = greater_candidates[argmin(abs.(greater_candidates .- omega_ref))]
-    end
-
-    L = contour_L()
-    load_on_workers()
-
-    @everywhere begin
-        normals_F = contour_normals(F)
-    end
-
-    alpha_L_u, alpha_L_l = contour_alpha_L_conti(L)
-    load_on_workers()
-
-    alpha_i_cache = copy(alpha_i)
-    zeta_alpha = adapt_zeta_alpha(F, alpha_L_u, alpha_L_l)
-
-    accepted = false
-    alpha_i_smooth = copy(alpha_i)
-
-    for attempt in 1:100
-        alpha_i_trial = copy(alpha_i)
-
-        for j in 2:(length(alpha_i_trial) - 1)
-            alpha_i_trial[j] = alpha_i[j] + delta_t * (
-                (alpha_i[j+1] - alpha_i[j-1]) / (alpha_r[j+1] - alpha_r[j-1]) * d_d_alpha_r_Phi_F(F[j])
-                - d_d_alpha_i_Phi_F(F[j])
-                + sigma * (
-                    (alpha_i[j+1] - 2.0 * alpha_i[j] + alpha_i[j-1]) /
-                    ((alpha_r[j+1] - alpha_r[j]) * (alpha_r[j] - alpha_r[j-1]))
-                ) / (
-                    1.0 + ((alpha_i[j+1] - alpha_i[j-1]) / (alpha_r[j+1] - alpha_r[j-1]))^2.0
-                )
-            )
+for k = 1:5000
+    global omega_i, L, alpha_L_u, alpha_L_l, alpha_i, F, omega_F, iteration_step
+    local dict_to_JSON, current_array
+    begin
+        omega_i_vectorization = fill(omega_i, N)
+        omega_i_cache = copy(omega_i_vectorization)
+        #global zeta_omega = adapt_zeta_omega(L, omega_F)
+        println(zeta_omega)
+        for j in 2:(length(omega_i_cache) - 1)
+            omega_i_cache[j] =  omega_i_vectorization[j] + delta_t * ( -lambda + (omega_i_vectorization[j+1] - omega_i_vectorization[j-1]) / (omega_r[j+1] - omega_r[j-1]) * d_d_omega_r_Phi_L(L[j]) - d_d_omega_i_Phi_L(L[j]))
         end
+        #
+        imag(omega_F)[argmax(imag(omega_F))]
+        greater_candidates = filter(x -> x > imag(omega_F)[argmax(imag(omega_F))], omega_i_cache)
+        global omega_i = greater_candidates[argmin(abs.(greater_candidates .- imag(omega_F)[argmax(imag(omega_F))]))]
+        #omega_i_cache[argmax(abs.(omega_i_cache))]
+        #omega_i = omega_i_cache[argmax(abs.(omega_i_cache))]
+        global L = contour_L()
+        load_on_workers()
+        @everywhere begin
+            normals_F = contour_normals(F)
+        end
+        global alpha_L_u, alpha_L_l = contour_alpha_L_conti(L)
+        load_on_workers()
+        #
+        alpha_i_cache = copy(alpha_i)
+        global zeta_alpha = adapt_zeta_alpha(F, alpha_L_u, alpha_L_l)
 
-        alpha_i_trial[1] = alpha_i_trial[2]
-        alpha_i_trial[end] = alpha_i_trial[end-1]
+        #=dt_start = 5e-3
+        dt_min = 1e-7
+        dt_tol = 5e-2
+        =#
 
-        alpha_i_smooth = rolling_average_filter(alpha_i_trial, 7)
-        factor = acceptance_factor.(F, Ref(alpha_L_u), Ref(alpha_L_l))
-        println(factor)
+        d_branch = branch_distance(alpha_L_u, alpha_L_l)
+        d_contour = contour_distance(F, alpha_L_u, alpha_L_l)
+        dt_min = 1e-7
+        dt_max = 5e-3
 
-        if all(abs.(alpha_i_trial .- alpha_i) .<= factor .* max.(abs.(alpha_i), 1e-12))
-            alpha_i_cache = copy(alpha_i_trial)
-            accepted = true
+        dt_start = min(delta_t, dt_max)
+
+        move_safety = 0.25
+        local_dist = local_contour_distances(F, alpha_L_u, alpha_L_l)
+        local_move_tol = move_safety .* max.(local_dist, 1e-8)
+
+        pinch_tol = 1e-4
+
+        println("d_branch = ", d_branch, ", d_contour = ", d_contour)
+
+        if d_branch < pinch_tol
+            println("Pinch tolerance reached. Stopping.")
             break
-        else
-            zeta_alpha *= 0.5
-            println("Rejected step, halving zeta_alpha -> ", zeta_alpha)
         end
-    end
 
-    println(zeta_alpha)
+        accepted = false
+        local_delta_t = dt_start
+        for attempt in 1:100
+            alpha_i_trial = copy(alpha_i)
+            for j in 2:(length(alpha_i_trial) - 1)
+                alpha_i_trial[j] = alpha_i[j] + local_delta_t * ((alpha_i[j+1] - alpha_i[j-1]) / (alpha_r[j+1] - alpha_r[j-1]) * d_d_alpha_r_Phi_F(F[j]) - d_d_alpha_i_Phi_F(F[j]) + sigma * ((alpha_i[j+1] - 2.0 * alpha_i[j] + alpha_i[j-1]) / ((alpha_r[j+1] - alpha_r[j]) * (alpha_r[j] - alpha_r[j-1]) ))  / (1.0 + ((alpha_i[j+1] - alpha_i[j-1]) / (alpha_r[j+1] - alpha_r[j-1]))^2.0))
+            end
+            alpha_i_trial[1] = alpha_i_trial[2]
+            alpha_i_trial[end] = alpha_i_trial[end-1]
+            #global alpha_i_smooth = spectral_filter(alpha_i_trial, 0.05)
+            #global alpha_i_smooth = rolling_average_filter(alpha_i_trial, 7)
+            #alpha_i_trial = rolling_average_filter(alpha_i_trial, 7)
+            alpha_i_trial = rolling_average_filter(alpha_i_trial, 3)#reduction of over smoothing 
+            #factor = acceptance_factor.(F, Ref(alpha_L_u), Ref(alpha_L_l))  
 
-    alpha_i = copy(alpha_i_smooth)
-    F = contour_F()
-    load_on_workers()
+            #zeta_ok = all(abs.(alpha_i_trial .- alpha_i) .<= factor .* max.(abs.(alpha_i), 1e-12)) # already existing condition implemented by kilian
+            #dt_ok = maximum(abs.(alpha_i_trial .- alpha_i)) <= dt_tol # condition 1 for adaptive time stepping 
+            #move = abs.(alpha_i_trial .- alpha_i)
+            #dt_ok = all(move .<= local_move_tol)
+            #println(factor)
+            move = abs.(alpha_i_trial .- alpha_i)
+            dt_ok = all(move .<= local_move_tol)
+            zeta_ok = true   # disable old relative condition for now
 
-    omega_F = contour_omega_F(F)
-    load_on_workers()
+            println("max move = ", maximum(move))
+            println("min local_move_tol = ", minimum(local_move_tol))
+            println("dt_ok = ", dt_ok)
 
-    dict_to_JSON = Dict(
-        "iteration" => iteration_step,
-        "L" => complexvec_to_json(L),
-        "alpha_L_u" => complexvec_to_json(alpha_L_u),
-        "alpha_L_l" => complexvec_to_json(alpha_L_l),
-        "F" => complexvec_to_json(F),
-        "omega_F" => complexvec_to_json(omega_F),
-    )
+           #= if zeta_ok && dt_ok
+                alpha_i_cache = copy(alpha_i_trial)
+                accepted = true
+                println("Accepted step with local_delta_t = ", local_delta_t, ", zeta_alpha = ", zeta_alpha)
+                println("Final accepted dt: ", local_delta_t)  #debug line for delta T
+                println("max move = ", maximum(abs.(alpha_i_trial .- alpha_i)))
+                break=#
+            if zeta_ok && dt_ok
+                alpha_i_cache = copy(alpha_i_trial)
+                accepted = true
 
-    json_str = open(filename, "r") do file
-        read(file, String)
-    end
+                global delta_t = min(1.2 * local_delta_t, dt_max)
 
-    current_array = JSON.parse(json_str)
-    push!(current_array, dict_to_JSON)
+                println("Accepted step with local_delta_t = ", local_delta_t, ", zeta_alpha = ", zeta_alpha)
+                println("Next delta_t = ", delta_t)
+                println("max move = ", maximum(move))
+                println("min local_move_tol = ", minimum(local_move_tol))
+                break    
+            else
+                if !zeta_ok
+                    global zeta_alpha *= 0.5
+                end
 
-    json_str = JSON.json(current_array)
-    open(filename, "w") do file
-        write(file, json_str)
-    end
+                local_delta_t *= 0.5
 
-    iteration_step += 1
+                if local_delta_t < dt_min
+                    println("delta_t below minimum. Rejecting this iteration.")
+                    break
+                end
+            end
+
+            #=if all(abs.(alpha_i_trial .- alpha_i) .<= factor .* max.(abs.(alpha_i), 1e-12))
+                alpha_i_cache = copy(alpha_i_trial)
+                accepted = true
+                #break
+            else
+                global zeta_alpha *= 0.5
+                println("Rejected step, halving zeta_alpha -> ", zeta_alpha)
+
+            end=#
+        end
+        if !accepted
+            println("No acceptable step found. Keeping old alpha_i.")
+            alpha_i_cache = copy(alpha_i)
+        end
+        println(zeta_alpha)
+        # ZERO DERIVATIVE BOUNDARY CONDITION #
+        #alpha_i_cache[1] = alpha_i_cache[2]
+        #alpha_i_cache[N] = alpha_i_cache[N-1]
+        #alpha_i_smooth = spectral_filter(alpha_i_cache, 0.05)
+        #global alpha_i = copy(alpha_i_smooth)
+    
+        global alpha_i = copy(alpha_i_cache) #Because alpha_i_smooth is just the last trial, and that last trial may have been rejected.
+        global F = contour_F()
+        load_on_workers()
+        global omega_F = contour_omega_F(F)
+        load_on_workers()
+        local dict_to_JSON = Dict(
+            "iteration" => iteration_step,
+            "L" => complexvec_to_json(L),
+            "alpha_L_u" => complexvec_to_json(alpha_L_u),
+            "alpha_L_l" => complexvec_to_json(alpha_L_l),
+            "F" => complexvec_to_json(F),
+            "omega_F" => complexvec_to_json(omega_F),
+        )
+        json_str = open(filename, "r") do file
+            read(file, String)
+        end
+        local current_array = JSON.parse(json_str)
+        push!(current_array, dict_to_JSON)
+        json_str = JSON.json(current_array)
+        open(filename, "w") do file
+            write(file, json_str)
+        end
+        global iteration_step += 1
+    end    
+    println("Iteration k = ", k)  
 end
 plot_omega()
 plot_alpha()
@@ -751,8 +816,7 @@ truncate_json!("contour_iteration.json"; offset=-1)
 ###
 ###
 
-#test = spectral_filter(F, 0.05)
-test = spectral_filter(alpha_i, 0.05)
+test = spectral_filter(F, 0.05)
 load_on_workers()
 plot_alpha()
 

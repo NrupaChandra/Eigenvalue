@@ -13,7 +13,7 @@ F_imag = [];
 alphaU_real = []; 
 alphaU_imag = [];
 alphaL_real = []; 
-alphaL_imag = [];
+alphaL_imag = [];   
 for k = 1:numIterations
     d = data(k);
     omega_real  = [omega_real, real(d.omega_F)];
@@ -38,7 +38,7 @@ alpha_xlim = alpha_xlim + margin * diff(alpha_xlim) * [-1, 1];
 alpha_ylim = alpha_ylim + margin * diff(alpha_ylim) * [-1, 1];
 
 
-make_contour_video('contour_iteration.json', 'contour_video.mp4', omega_xlim, omega_ylim, alpha_xlim, alpha_ylim)
+make_contour_video('contour_iteration.json', 'contour_video5.mp4', omega_xlim, omega_ylim, alpha_xlim, alpha_ylim)
 
 %% Load JSON
 function data = read_contour_integration_json(filename)
