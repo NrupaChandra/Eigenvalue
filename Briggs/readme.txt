@@ -20,4 +20,4 @@
 
 8. `briggsv4.1.jl` is a small improvement of `briggsv4.jl`. It prevents the omega contour from accepting steps that are too small to be useful. This avoids cases where the algorithm technically accepts a step, but the contour almost does not move. It should be used if `briggsv4.jl` stagnates or makes only very small progress.
 
-9. `briggsv5.jl` is a more experimental version. It increases the contour resolution from `N = 100` to `N = 200`, starts the omega contour above `omega_F`, and automatically chooses a valid starting point for branch tracking. Like v4, it uses the projection relative to the alpha contour `F` to separate upper and lower branch candidates. It also adds more robust checks for invalid or overlapping branches and allows the omega contour to become temporarily blocked instead of stopping the whole run immediately. This version is useful for testing whether the method can continue safely near the pinch region, but it should be treated carefully because it changes several parts of the algorithm at once.
+9. `briggsv5.jl` stil working on it
