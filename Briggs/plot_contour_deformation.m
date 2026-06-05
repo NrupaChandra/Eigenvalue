@@ -1,5 +1,5 @@
 
-data = read_contour_integration_json('contour_iteration.json');
+data = read_contour_integration_json('contour_iteration_algebraic_testv4.json');
 
 %% Video
 
@@ -38,7 +38,7 @@ alpha_xlim = alpha_xlim + margin * diff(alpha_xlim) * [-1, 1];
 alpha_ylim = alpha_ylim + margin * diff(alpha_ylim) * [-1, 1];
 
 
-make_contour_video('contour_iteration.json', 'contour_video5.mp4', omega_xlim, omega_ylim, alpha_xlim, alpha_ylim)
+make_contour_video('contour_iteration_algebraic_testv4.json', 'contour_video15.mp4', omega_xlim, omega_ylim, alpha_xlim, alpha_ylim)
 
 %% Load JSON
 function data = read_contour_integration_json(filename)
@@ -53,7 +53,7 @@ function data = read_contour_integration_json(filename)
         'alpha_L_u', [], ...
         'alpha_L_l', [] ...
     );
-    for k = 1:numIterations-1
+    for k = 1:numIterations
         entry = jsonData(k);
         data(k).iteration = entry.iteration;
         data(k).F         = reim_to_complex(entry.F);
