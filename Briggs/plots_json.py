@@ -75,7 +75,7 @@ ax.grid(True, alpha=0.3)
 ax.legend()
 ax.set_aspect("equal", adjustable="box")
 
-# Optional: set limits similar to your screenshot
+# Optional: set limits 
 ax.set_xlim(-1.1, 0.65)
 ax.set_ylim(-1.15, 0.40)
 
