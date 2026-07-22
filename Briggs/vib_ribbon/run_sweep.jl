@@ -12,6 +12,7 @@ include("ribbon_core.jl")
 using JSON, Printf
 
 function save_sweep(results, filename)
+    mkpath(dirname(filename))   # create results/ if it does not exist yet
     arr = [Dict("w_f" => r.w_f,
                 "alpha_plus"  => Dict("re" => real(r.alpha_plus),  "im" => imag(r.alpha_plus)),
                 "alpha_minus" => Dict("re" => real(r.alpha_minus), "im" => imag(r.alpha_minus)),
