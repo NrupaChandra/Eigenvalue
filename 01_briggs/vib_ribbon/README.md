@@ -15,7 +15,9 @@ unchanged** — the ribbon just fixes ω to a real forcing frequency ω_f.
 
 ## Folder structure
 
-- `src/` — `briggsv4_ribbon.jl`, `briggsv4.1_ribbon.jl`
+- `src/` — `briggsv4_ribbon.jl`, `briggsv4.1_ribbon.jl`, `briggsv4.2_ribbon.jl`
+- `postprocessing/` — `plot_contour_deformation_ribbon.m` (video renderer for the
+  v4.2 JSON; no exact-pinch markers, overlays the descent branches in gray)
 - `results/` — output JSON (`contour_iteration_v4.1_ribbon.json`) and animation
   (`contour_video4.1ribbon.mp4`; videos are git-ignored, local only)
 
@@ -38,7 +40,26 @@ change: the *saved* per-frame contour is the NEAT ribbon (Hankel) contour that d
 it finds is the flow's intrinsic pinch (Im ω₀ < 0 ⇒ not absolutely unstable).
 Output: `contour_iteration_v4.1_ribbon.json`.
 
-Both use Re = 2000, β = 0, num_modes = 150 and run in parallel via `Distributed`
+> **Known v4.1 issue:** the saved ribbon branches were classified *independently* at each
+> contour point (no continuity), so they mode-hopped — on the vertical risers essentially
+> every point jumped to a different eigenvalue (jumps up to ~1.5 in |α|). That is the noise
+> visible in `contour_video4.1ribbon.mp4`. The tracked descent branches, which do close
+> smoothly to the pinch (dUL → 1e-4), were never saved. The old videos also carried an
+> "exact pinch" marker hard-coded for the algebraic test case — meaningless here (no
+> analytical pinch point exists for Couette flow).
+
+**`briggsv4.2_ribbon.jl`** — same descent (still byte-identical to `briggsv4.jl`), animation
+fixed: (1) display branches are continuity-tracked along the Hankel contour (spatial spectra
+computed in parallel, then serial nearest-neighbour continuation with a damped linear
+predictor, seeded from the descent's tracked branches at the left contour end); (2) riser
+resolution 25 → 60 points each (n_L = 376); (3) the descent's straight contour and tracked
+branches are saved per frame (`L_descent`, `alpha_L_u_descent`, `alpha_L_l_descent`) so the
+real pinch closing is visible; (4) JSON frames kept in memory instead of re-parsing the file
+every iteration. Render with `postprocessing/plot_contour_deformation_ribbon.m` (no
+exact-pinch marker; descent branches overlaid in gray).
+Output: `contour_iteration_v4.2_ribbon.json`.
+
+All use Re = 2000, β = 0, num_modes = 150 and run in parallel via `Distributed`
 (`addprocs(31)` — reduce for local runs).
 
 ## How to run
