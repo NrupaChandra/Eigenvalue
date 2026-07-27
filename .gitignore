@@ -1,2 +1,5 @@
 .vscode/
 *.mp4
+
+# large generated result files (keep local, like *.mp4)
+contour_iteration_*.json

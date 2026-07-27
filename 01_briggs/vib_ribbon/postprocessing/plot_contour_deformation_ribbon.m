@@ -1,14 +1,17 @@
 % plot_contour_deformation_ribbon.m -- video renderer for the vibrating-ribbon
-% runs (briggsv4.2_ribbon.jl). Adapted from plot_contour_deformation_test.m with
-% two changes:
+% runs (briggsv4.2_ribbon.jl / briggsv4.3_ribbon.jl). Adapted from
+% plot_contour_deformation_test.m with two changes:
 %   1. NO exact/analytical pinch markers: no analytical pinch point exists for
 %      plane Couette flow, the markers in the test script belong to the
 %      algebraic test case only.
-%   2. The descent diagnostics saved by v4.2 (L_descent, alpha_L_u_descent,
-%      alpha_L_l_descent) are overlaid in gray, so the actual tracked branches
-%      that close to the pinch are visible next to the ribbon display branches.
+%   2. The descent diagnostics (L_descent, alpha_L_u_descent, alpha_L_l_descent)
+%      are overlaid in gray, so the actual tracked branches that drive the
+%      descent are visible next to the ribbon display branches.
 
-data = read_contour_integration_json('contour_iteration_v4.2_ribbon.json');
+jsonfile   = 'contour_iteration_v4.3_ribbon.json';
+outputfile = 'contour_video4.3_ribbon.mp4';
+
+data = read_contour_integration_json(jsonfile);
 
 %% Build fixed axis limits for the full video
 
@@ -68,8 +71,8 @@ alpha_ylim = alpha_ylim + margin * alpha_dy * [-1, 1];
 %% Make video
 
 make_contour_video( ...
-    'contour_iteration_v4.2_ribbon.json', ...
-    'contour_video4.2_ribbon.mp4', ...
+    jsonfile, ...
+    outputfile, ...
     omega_xlim, omega_ylim, alpha_xlim, alpha_ylim ...
 );
 
