@@ -8,8 +8,21 @@
 %      are overlaid in gray, so the actual tracked branches that drive the
 %      descent are visible next to the ribbon display branches.
 
-jsonfile   = 'contour_iteration_v4.3_ribbon.json';
-outputfile = 'contour_video4.3_ribbon.mp4';
+% NOTE on the grey curves: from v4.4 on they are a genuine INDEPENDENT
+% cross-check. Red is the ribbon branch, continuity-tracked from its own freshly
+% solved spectra; grey is the descent's own tracked branch. In v4.3 the two were
+% identical by construction on the horizontal parts (the values were copied
+% there), so agreement meant nothing. They are now computed separately and are
+% NOT forced to agree -- if they part company, that is a result, not a bug.
+
+jsonfile   = 'contour_iteration_v4.5_ribbon.json';
+outputfile = 'contour_video4.5_ribbon.mp4';
+
+% previous runs:
+% jsonfile   = 'contour_iteration_v4.4_ribbon.json';
+% outputfile = 'contour_video4.4_ribbon.mp4';
+% jsonfile   = 'contour_iteration_v4.3_ribbon_repaired.json';
+% outputfile = 'contour_video4.3_ribbon.mp4';
 
 data = read_contour_integration_json(jsonfile);
 

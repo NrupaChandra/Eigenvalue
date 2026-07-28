@@ -97,7 +97,71 @@ changed**, only the sampling and continuation numerics:
    on, with `d_branch` flat at 1.16e−1 (`pinch_tol` = 1e−4 never reached), so iterations
    277–1102 produced no new information.
 
-Output: `contour_iteration_v4.3_ribbon.json`. Render with
+Output: `contour_iteration_v4.3_ribbon.json`.
+
+> **Known v4.3 issue (methodological, not numerical):** to guarantee the horizontals agreed
+> with the descent, v4.3 *copied* the descent's tracked α values onto them instead of
+> recomputing. The values were correct — same ω, same spectrum — but 96 of 476 points
+> (**36.5 % of the drawn curve length**) were then identical to the descent branch by
+> construction, so the grey overlay could not disagree with the red curve there and stopped
+> being a check at all.
+
+**`briggsv4.4_ribbon.jl`** — descent still byte-identical to `briggsv4.jl`. **Nothing is
+copied:** every point of the ribbon contour gets its own spectrum and its own branch
+decision, so the grey descent overlay becomes a genuine independent cross-check.
+
+- display branches are continuity-tracked over the **whole** contour (horizontals included);
+- seeds are **not** the descent's stored values — they are the side-of-F classification (the
+  descent's own rule) recomputed from the freshly solved spectrum at each end;
+- horizontal resolution doubled (`n_sub = 2`), dropping the median α step there from 0.033 to
+  ≈ 0.017, below `da_max = 0.03`. The guard stays strict rather than being loosened;
+- descent grid points remain a **subset** of the ribbon horizontals, so red-vs-grey is
+  compared at identical ω with no interpolation. n_L = 570.
+
+Four diagnostics per frame (printed and stored in the JSON):
+
+| field | meaning |
+|---|---|
+| `xcheck_u/l` | tracked ribbon branch vs descent branch (red vs grey) — the cross-check, not forced to zero |
+| `sideclass_u/l` | tracked branch vs side-of-F classification evaluated independently from the same spectrum |
+| `fwdbwd_u/l` | forward traversal (left seed) vs backward traversal (right seed) over the same nodes |
+| `loop_mono_u/l` | **monodromy** of the closed detour: up the left riser + arc + down the right riser, vs straight along the bottom. Nonzero ⇒ the loop encloses a branch point of α(ω) |
+
+`xcheck` is deliberately *not* forced to zero. The descent's rule is a selection ("nearest
+eigenvalue on the correct side of F"), not an analytic continuation, so the two can
+legitimately part company where the descent switches modes — that is a result, not a bug.
+
+Output: `contour_iteration_v4.4_ribbon.json`.
+
+> **Known v4.4 issue:** the *tracking* was clean — max step 0.017 against a 0.03 guard, zero
+> guard trips, zero refinements, 100 % of points on the upper side of F at every frame — but
+> the branch it followed **drifted away from F**: median |α − F| went 0.035 → 0.786 → **2.079**
+> (it = 11 / 61 / 301), against 0.035 → 0.114 → 0.612 for the descent branch. Briggs needs the
+> branches *adjacent* to F, the ones that collide at the pinch; a branch 2 units away is a
+> valid eigenvalue branch and irrelevant.
+>
+> Two causes. **The seed:** v4.4 seeded at the contour's left *end*, ω_r = 0. At purely
+> imaginary ω the spectrum is symmetric under α → −ᾱ, so the seed chooses between **mirror
+> twins** (verified to 7 digits: +0.7836 − 1.9284i vs the descent's −0.7836 − 1.9284i at
+> it = 301). The tiebreak is "closer to F" and the margin was **2.6 %** at it = 21 — a coin
+> flip, which flipped. **The corrector:** it took the nearest eigenvalue to the predictor with
+> no side-of-F constraint, so nothing kept it adjacent once it had left.
+
+**`briggsv4.5_ribbon.jl`** — fixes **A + B**, both of which apply the *existing* descent rule.
+No value is copied; every α still comes from this script's own freshly solved spectra.
+
+- **A — seed at the interior node the descent seeds at** (`start_index = N/4`, ω_r ≈ 0.121)
+  instead of the contour end, then march outward in both directions — exactly the protocol of
+  `contour_alpha_L_conti`. At that node the branch sits next to F and there is no mirror twin.
+- **B — the corrector filters candidates by side of F** before taking the nearest to the
+  predictor, i.e. the rule of `couetteflow_spatial_sing_mode_comparison`. As there, an empty
+  side falls back to nearest-overall — and every fallback is **counted and reported**
+  (`nfallb_u/l`), so the filter cannot silently swallow a branch that genuinely leaves F.
+
+Diagnostics per frame: `xcheck_u/l` (red vs grey at identical ω, not forced to zero),
+`sideclass_u/l`, `nfallb_u/l`, `loop_mono_u/l` (monodromy of the closed detour).
+
+Output: `contour_iteration_v4.5_ribbon.json`. Render with
 `postprocessing/plot_contour_deformation_ribbon.m`.
 
 All use Re = 2000, β = 0, num_modes = 150 and run in parallel via `Distributed`
