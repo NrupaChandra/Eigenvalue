@@ -1,53 +1,51 @@
-# briggsv4.3_ribbon.jl -- same DESCENT as v4.1/v4.2 (byte-identical to briggsv4.jl:
-# matrices, branch definition, tracking rule, guards, lambda=4.0, sigma=3e-5,
-# delta_t=1e-3, straight descending L, pinch_tol). NO theory is changed here --
-# only the numerics of how the ribbon (Hankel) contour is sampled and how its
-# display branches are continued.
+# briggsv4.4_ribbon.jl -- same DESCENT as v4.1/v4.2/v4.3 (byte-identical to
+# briggsv4.jl apart from file I/O and the iteration cap). NO theory changed.
 #
-# v4.2 problem (diagnosed from contour_iteration_v4.2_ribbon.json):
-#   the display branches were continued from a SINGLE seed at the left end of the
-#   contour by plain nearest-neighbour matching on a uniform grid. On the vertical
-#   risers the UPPER branch legitimately travels ~2.7 in |alpha| across only 60
-#   points, i.e. ~0.06 per step, which is the same order as the local spacing of
-#   the spatial OS spectrum -> the continuation hopped modes on the way up the
-#   left riser and never recovered. Decisive test: omega = omega_f - r_arc + 0i is
-#   the SAME physical point in every frame, so alpha there must be frame
-#   independent. Frame 1 (descent on the real axis) gives alpha_u = 0.4012+0.0740i;
-#   from frame 30 on, v4.2 reported 0.556..0.572 + 0.215..0.227i -- a different
-#   eigenvalue. Because it then came back down the right riser on the wrong mode,
-#   the whole RIGHT horizontal was wrong (median error vs the descent branch grew
-#   to 2.43), which is the "upper curve drifts away from F" seen in the video.
-#   The LOWER branch moves only ~0.2 over the same riser (max step 0.044) and so
-#   survived -- hence only the upper branch looked broken.
+# What v4.3 did wrong (not numerically, but methodologically):
+#   to guarantee the ribbon's horizontals agreed with the descent, v4.3 COPIED
+#   the descent's tracked alpha values onto them instead of recomputing. The
+#   values were correct -- same omega, same spectrum -- but 96 of 476 points
+#   (36.5% of the drawn curve length) were then identical to the descent branch
+#   by construction, so the grey overlay could not disagree with the red curve
+#   there and stopped being a check at all.
 #
-# v4.3 fixes, all numerical:
-#   1. The horizontal parts of the ribbon contour are placed ON the descent grid
-#      omega_r, so they are the SAME omega points the descent already solved. Their
-#      alpha values are taken directly from the descent's tracked branches instead
-#      of being re-classified. Same eigenvalue problem, same branch rule, no extra
-#      solves -- the horizontals now agree with the plain Briggs run exactly.
-#   2. Only the detour (risers + arc) is continued, and it is anchored at BOTH
-#      ends: the left riser is tracked upward from the descent value at
-#      omega_f - r_arc, the right riser upward from the descent value at
-#      omega_f + r_arc. Each tracked path is short and starts from a trusted value,
-#      so the two sides of the detour are independent and the out-and-back loop
-#      closes.
-#   3. Riser resolution 60 -> 160 points, arc 40 -> 60, and the continuation uses a
-#      secant (first-order) predictor with a step-limited corrector plus adaptive
-#      bisection: a step is rejected if |d alpha| > da_max or if the nearest
-#      eigenvalue is not clearly nearer than the runner-up (separation guard). All
-#      rejected intervals are bisected and re-solved in one parallel batch, up to
-#      max_refine passes. Output is resampled back onto the fixed display grid so
-#      the saved frame size stays constant.
-#   4. Per-frame closure diagnostic arc_mismatch_u / arc_mismatch_l: the gap
-#      between the arc end and the independently tracked top of the right riser.
-#      Small => the loop closed on one mode; large => the detour is still hopping.
-#   5. Iteration cap 1500 -> 300. The v4.2 run showed omega_i frozen at -0.57249
-#      from iteration ~276 on, with d_branch flat at 1.16e-1 (pinch_tol = 1e-4 is
-#      never reached), so iterations 277-1102 produced no new information.
-# No analytical pinch point exists for this case; no exact-pinch marker is drawn.
+# v4.4: nothing is copied. Every point of the ribbon contour gets its own
+# spectrum and its own branch decision, so the grey descent overlay becomes a
+# genuine, independent cross-check:
+#   1. the display branches are continuity-tracked over the WHOLE ribbon contour
+#      (horizontals included) with the v4.3 predictor/corrector, separation guard
+#      and adaptive bisection;
+#   2. the seeds are NOT taken from the descent's stored values. They are the
+#      side-of-F classification -- the descent's own rule -- recomputed from the
+#      freshly solved spectrum at each end of the contour;
+#   3. horizontal resolution is doubled (n_sub = 2, midpoint of every descent
+#      interval) so the median alpha step there drops from 0.033 to ~0.017, below
+#      da_max = 0.03. The guard stays strict rather than being loosened;
+#   4. the descent grid points remain a subset of the ribbon horizontals, so the
+#      red-vs-grey comparison is at IDENTICAL omega -- no interpolation.
+#
+# Four diagnostics are computed per frame and printed (all are max |.| over the
+# horizontal nodes unless stated):
+#   xcheck_u/l    tracked ribbon branch vs the descent's tracked branch (red vs
+#                 grey). This is the cross-check. It is NOT forced to zero; if
+#                 the two disagree that is a result, not a bug -- the descent's
+#                 rule is a selection ("nearest eigenvalue on the correct side of
+#                 F"), not an analytic continuation, so they may legitimately
+#                 part company where the descent switches modes.
+#   sideclass_u/l tracked branch vs the side-of-F classification evaluated
+#                 independently at the same point, from the same spectrum.
+#   fwdbwd_u/l    forward traversal (from the left seed) vs backward traversal
+#                 (from the right seed) over the same nodes.
+#   loop_mono_u/l MONODROMY of the closed detour: continue up the left riser,
+#                 around the arc and down the right riser, then compare against
+#                 continuing straight along the bottom between the same two
+#                 points. Nonzero => the loop encloses a branch point of
+#                 alpha(omega), so the two routes land on different sheets. This
+#                 replaces v4.3's arc_mismatch, which measured the same thing
+#                 less directly.
+# No analytical pinch point exists for this case; none is drawn.
 # omega_f only positions the detour; it does not steer the descent.
-# Run from vib_ribbon/src/:  julia briggsv4.3_ribbon.jl
+# Run from vib_ribbon/src/:  julia briggsv4.4_ribbon.jl
 # Kilian Vinzenz Wilhelm
 begin
     using Distributed, Plots, BenchmarkTools, FFTW, JSON, Statistics, Printf
@@ -254,9 +252,32 @@ begin
     # straight from the descent's tracked branches (no re-classification).
     n_ver = 160          # points per vertical riser
     n_arc = 60           # points on the semicircle over omega_f
+    n_bot = 21           # points on the short bottom segment (monodromy test only)
+    n_sub = 2            # horizontal refinement: subdivisions per descent interval
     idx_hor_left  = findall(w -> w <= omega_f - r_arc, collect(omega_r))
     idx_hor_right = findall(w -> w >= omega_f + r_arc, collect(omega_r))
     @assert !isempty(idx_hor_left) && !isempty(idx_hor_right) "omega_f +/- r_arc outside the omega_r range"
+
+    # Refine the horizontals while KEEPING the descent nodes as a subset, so the
+    # red-vs-grey cross-check is at identical omega with no interpolation.
+    function subdivide(xs, m)
+        m <= 1 && return collect(float.(xs))
+        out = Float64[]
+        for i in 1:(length(xs) - 1), k in 0:(m - 1)
+            push!(out, xs[i] + (xs[i+1] - xs[i]) * k / m)
+        end
+        push!(out, float(xs[end]))
+        return out
+    end
+    wl_ref = subdivide(collect(omega_r)[idx_hor_left],  n_sub)
+    wr_ref = subdivide(collect(omega_r)[idx_hor_right], n_sub)
+    n_hl = length(wl_ref); n_hr = length(wr_ref)
+    # positions of the descent nodes inside the full ribbon contour
+    map_hl = [(j - 1) * n_sub + 1 for j in 1:length(idx_hor_left)]
+    off_hr = n_hl + n_ver + n_arc + n_ver
+    map_hr = [off_hr + (j - 1) * n_sub + 1 for j in 1:length(idx_hor_right)]
+    i_riser_bot_L = n_hl + 1        # bottom of the left riser,  omega_f - r_arc + i*omega_i
+    i_riser_bot_R = off_hr          # bottom of the right riser, omega_f + r_arc + i*omega_i
 
     riser_left_nodes(omega_i_level)  = ComplexF64.((omega_f - r_arc) .+ im .* collect(LinRange(omega_i_level, 0.0, n_ver)))
     riser_right_nodes(omega_i_level) = ComplexF64.((omega_f + r_arc) .+ im .* collect(LinRange(omega_i_level, 0.0, n_ver)))
@@ -264,12 +285,16 @@ begin
 
     function hankel_L(omega_i_level)
         # NEAT Eq.(24) ribbon contour at horizontal level omega_i_level:
-        # horizontals (on the descent grid) + vertical risers + semicircle over omega_f.
-        seg1 = ComplexF64.(collect(omega_r)[idx_hor_left]  .+ im * omega_i_level)
-        seg5 = ComplexF64.(collect(omega_r)[idx_hor_right] .+ im * omega_i_level)
+        # horizontals (descent grid, subdivided) + risers + semicircle over omega_f.
+        seg1 = ComplexF64.(wl_ref .+ im * omega_i_level)
+        seg5 = ComplexF64.(wr_ref .+ im * omega_i_level)
         return vcat(seg1, riser_left_nodes(omega_i_level), arc_nodes(),
                     reverse(riser_right_nodes(omega_i_level)), seg5)
     end
+    # short straight segment closing the detour along the bottom, used only for
+    # the monodromy test (it lies on the descent line L).
+    bottom_nodes(omega_i_level) =
+        ComplexF64.(collect(LinRange(omega_f - r_arc, omega_f + r_arc, n_bot)) .+ im * omega_i_level)
     @everywhere L = Vector{Complex{Float64}}[]
     L = contour_L()
     #
@@ -660,7 +685,7 @@ begin
     function complexvec_to_json(vec)
         return [Dict("re" => real(x), "im" => imag(x)) for x in vec]
     end
-    filename = "contour_iteration_v4.3_ribbon.json"
+    filename = "contour_iteration_v4.4_ribbon.json"
 end
 
 # ---- ribbon animation frame (v4.3): descent-anchored, adaptively refined ----
@@ -723,16 +748,17 @@ function continue_branch(nodes, spectra, seed; da_max = 0.03, sep_frac = 0.6)
     return vals, flag
 end
 
-# Track a path, bisecting every rejected interval and re-solving it in one
-# parallel batch, then return the values at the ORIGINAL nodes only (so the saved
-# frame keeps a fixed size).
-function track_path(nodes0, spectra0, seed; max_refine = 4, node_cap = 1200,
-                    da_max = 0.03, sep_frac = 0.6)
+# Refine a path (bisecting every rejected interval, re-solved in one parallel
+# batch) using the forward pass, then evaluate BOTH a forward traversal and a
+# backward traversal on the same final node set. Values are returned at the
+# ORIGINAL nodes only, so the saved frame keeps a fixed size.
+function track_two_way(nodes0, spectra0, seed_fwd, seed_bwd; max_refine = 4,
+                       node_cap = 2400, da_max = 0.03, sep_frac = 0.6)
     nodes   = copy(nodes0)
-    spectra = copy(spectra0)
+    spectra = Vector{Vector{ComplexF64}}(spectra0)
     is_orig = trues(length(nodes))
-    vals, flag = continue_branch(nodes, spectra, seed; da_max = da_max, sep_frac = sep_frac)
     n_added = 0
+    vals_f, flag = continue_branch(nodes, spectra, seed_fwd; da_max = da_max, sep_frac = sep_frac)
     for _ in 1:max_refine
         ins_at = Int[]; ins_w = ComplexF64[]
         for j in 2:length(nodes)
@@ -753,70 +779,101 @@ function track_path(nodes0, spectra0, seed; max_refine = 4, node_cap = 1200,
             push!(nn, nodes[j]); push!(ss, spectra[j]); push!(oo, is_orig[j])
         end
         nodes = nn; spectra = ss; is_orig = oo
-        vals, flag = continue_branch(nodes, spectra, seed; da_max = da_max, sep_frac = sep_frac)
+        vals_f, flag = continue_branch(nodes, spectra, seed_fwd; da_max = da_max, sep_frac = sep_frac)
     end
-    return vals[is_orig], n_added
+    vals_b_rev, _ = continue_branch(reverse(nodes), reverse(spectra), seed_bwd;
+                                    da_max = da_max, sep_frac = sep_frac)
+    vals_b = reverse(vals_b_rev)
+    return vals_f[is_orig], vals_b[is_orig], n_added
+end
+
+# One-shot continuation used for the monodromy leg (no refinement needed: the
+# bottom segment is short and lies on the descent line).
+function track_simple(nodes, seed; da_max = 0.03, sep_frac = 0.6)
+    spectra = pmap(spatial_spectrum, nodes)
+    vals, _ = continue_branch(nodes, spectra, seed; da_max = da_max, sep_frac = sep_frac)
+    return vals
+end
+
+# The descent's OWN branch rule -- "of the eigenvalues on each side of F, take the
+# one closest to F" -- applied to an already-computed spectrum. Identical logic to
+# dominant_eigvals(), but it does not re-solve the eigenvalue problem.
+function classify_by_F(evs, F, normals_F)
+    best_u = nothing; best_l = nothing
+    du = Inf; dl = Inf
+    for ev in evs
+        dists = [abs(ev - f) for f in F]
+        idx = argmin(dists)
+        proj = real(conj(normals_F[idx]) * (ev - F[idx]))
+        d = dists[idx]
+        if proj > 0.0 && d < du
+            du = d; best_u = ev
+        elseif proj < 0.0 && d < dl
+            dl = d; best_l = ev
+        end
+    end
+    return best_u, best_l
 end
 
 function descent_branch_clean(branch)
     return ComplexF64[x === nothing ? ComplexF64(NaN, NaN) : ComplexF64(x) for x in branch]
 end
 
-# Descent value at index idx, falling back to the nearest finite neighbour.
-function safe_seed(branch, idx)
-    v = branch[idx]
-    if v !== nothing && isfin(ComplexF64(v))
-        return ComplexF64(v)
-    end
-    n = length(branch)
-    for d in 1:n
-        for j in (idx - d, idx + d)
-            if 1 <= j <= n
-                u = branch[j]
-                if u !== nothing && isfin(ComplexF64(u))
-                    return ComplexF64(u)
-                end
-            end
-        end
-    end
-    return ComplexF64(NaN, NaN)
+# Fall back to the eigenvalue nearest F if a side happens to be empty.
+function seed_or_nearest(cand, evs, F)
+    (cand !== nothing && isfin(ComplexF64(cand))) && return ComplexF64(cand)
+    isempty(evs) && return ComplexF64(NaN, NaN)
+    return ComplexF64(evs[argmin([minimum(abs.(ev .- F)) for ev in evs])])
 end
+
+maxabsdiff(a, b) = isempty(a) ? 0.0 : maximum(abs.(ComplexF64.(a) .- ComplexF64.(b)))
 
 function make_ribbon_frame(iter)
     Lh = hankel_L(omega_i)
+    spectra = pmap(spatial_spectrum, Lh)
 
-    # Detour paths, each anchored at the descent node where it leaves the horizontal.
-    iL = idx_hor_left[end]      # last descent node left of the detour
-    iR = idx_hor_right[1]       # first descent node right of the detour
-    pathL = vcat(ComplexF64(L[iL]), riser_left_nodes(omega_i), arc_nodes())
-    pathR = vcat(ComplexF64(L[iR]), riser_right_nodes(omega_i))
+    # --- seeds: the descent's RULE recomputed here, not the descent's values ---
+    su_L, sl_L = classify_by_F(spectra[1],   F, normals_F)
+    su_R, sl_R = classify_by_F(spectra[end], F, normals_F)
+    seed_u_L = seed_or_nearest(su_L, spectra[1],   F)
+    seed_l_L = seed_or_nearest(sl_L, spectra[1],   F)
+    seed_u_R = seed_or_nearest(su_R, spectra[end], F)
+    seed_l_R = seed_or_nearest(sl_R, spectra[end], F)
 
-    # Spectra depend only on omega, so the base grids are shared by both branches.
-    specL = pmap(spatial_spectrum, pathL)
-    specR = pmap(spatial_spectrum, pathR)
+    au, au_bwd, add_u = track_two_way(Lh, spectra, seed_u_L, seed_u_R)
+    al, al_bwd, add_l = track_two_way(Lh, spectra, seed_l_L, seed_l_R)
+    @assert length(au) == length(Lh) "ribbon branch/contour length mismatch"
 
     ud = descent_branch_clean(alpha_L_u)
     ld = descent_branch_clean(alpha_L_l)
 
-    uL, addL_u = track_path(pathL, specL, safe_seed(alpha_L_u, iL))
-    uR, addR_u = track_path(pathR, specR, safe_seed(alpha_L_u, iR))
-    lL, addL_l = track_path(pathL, specL, safe_seed(alpha_L_l, iL))
-    lR, addR_l = track_path(pathR, specR, safe_seed(alpha_L_l, iR))
+    # --- diagnostic 1: red vs grey, at identical omega, NOT forced to agree ---
+    hidx = vcat(map_hl, map_hr); didx = vcat(idx_hor_left, idx_hor_right)
+    xcheck_u = maxabsdiff(au[hidx], ud[didx])
+    xcheck_l = maxabsdiff(al[hidx], ld[didx])
 
-    # Drop the anchor node (index 1), it belongs to the horizontal segment.
-    u_riserL = uL[2:1+n_ver];  u_arc = uL[2+n_ver:end];  u_riserR = uR[2:end]
-    l_riserL = lL[2:1+n_ver];  l_arc = lL[2+n_ver:end];  l_riserR = lR[2:end]
+    # --- diagnostic 2: continuation vs side-of-F classification, same spectrum ---
+    su = 0.0; sl = 0.0
+    for i in hidx
+        cu, cl = classify_by_F(spectra[i], F, normals_F)
+        cu !== nothing && (su = max(su, abs(au[i] - ComplexF64(cu))))
+        cl !== nothing && (sl = max(sl, abs(al[i] - ComplexF64(cl))))
+    end
 
-    # Closure diagnostic: arc end vs the independently tracked top of the right riser.
-    arc_mismatch_u = abs(u_arc[end] - u_riserR[end])
-    arc_mismatch_l = abs(l_arc[end] - l_riserR[end])
+    # --- diagnostic 3: forward vs backward traversal ---
+    fwdbwd_u = maxabsdiff(au, au_bwd)
+    fwdbwd_l = maxabsdiff(al, al_bwd)
 
-    au = vcat(ud[idx_hor_left], u_riserL, u_arc, reverse(u_riserR), ud[idx_hor_right])
-    al = vcat(ld[idx_hor_left], l_riserL, l_arc, reverse(l_riserR), ld[idx_hor_right])
-    @assert length(au) == length(Lh) "ribbon branch/contour length mismatch"
+    # --- diagnostic 4: monodromy of the closed detour ---
+    # up the left riser + arc + down the right riser  vs  straight along the bottom
+    bn = bottom_nodes(omega_i)
+    bu = track_simple(bn, au[i_riser_bot_L])
+    bl = track_simple(bn, al[i_riser_bot_L])
+    loop_mono_u = abs(bu[end] - au[i_riser_bot_R])
+    loop_mono_l = abs(bl[end] - al[i_riser_bot_R])
 
-    @printf("        ribbon: dArc_u=%.3e dArc_l=%.3e | refined nodes u=%d l=%d\n",
-            arc_mismatch_u, arc_mismatch_l, addL_u + addR_u, addL_l + addR_l)
+    @printf("        ribbon: xcheck=%.3e/%.3e side=%.3e/%.3e fwdbwd=%.3e/%.3e mono=%.3e/%.3e | refined u=%d l=%d\n",
+            xcheck_u, xcheck_l, su, sl, fwdbwd_u, fwdbwd_l, loop_mono_u, loop_mono_l, add_u, add_l)
     flush(stdout)
 
     return Dict(
@@ -831,8 +888,10 @@ function make_ribbon_frame(iter)
         "L_descent"         => complexvec_to_json(L),
         "alpha_L_u_descent" => complexvec_to_json(ud),
         "alpha_L_l_descent" => complexvec_to_json(ld),
-        "arc_mismatch_u"    => arc_mismatch_u,
-        "arc_mismatch_l"    => arc_mismatch_l,
+        "xcheck_u"      => xcheck_u,    "xcheck_l"      => xcheck_l,
+        "sideclass_u"   => su,          "sideclass_l"   => sl,
+        "fwdbwd_u"      => fwdbwd_u,    "fwdbwd_l"      => fwdbwd_l,
+        "loop_mono_u"   => loop_mono_u, "loop_mono_l"   => loop_mono_l,
     )
 end
 
