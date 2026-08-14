@@ -30,14 +30,15 @@
 #   downstream curve -- v4.6); v5 had the second and not the first (it tears the
 #   curve at the crossing). Both fail in the same neighbourhood.
 #
-#   HONEST LIMIT: at closest approach the branches are 0.0027 apart while the
-#   eigenvalue accuracy of this discretisation there is 5e-3..1.5e-2 (see
-#   ../analysis/conv.py). The separation is BELOW the noise floor, so no
-#   continuation scheme can decide which branch is which at omega*. v5.1 makes
-#   the curve continuous and makes the conflict VISIBLE and FATAL rather than
-#   silent; it does not pretend to resolve it. Resolving it needs the
-#   discretisation rewrite (physical-space chebdif, or a clamped
-#   (1-eta^2)^2 T_k basis) or an L contour indented around omega*.
+#   RESOLVED IN v5.1 -- see CHANGE F. The "0.0027 gap" and the "5e-3..1.5e-2
+#   noise floor" were both artefacts of running at num_modes = 150, which is
+#   past the divergent threshold of this discretisation. At num_modes = 80 the
+#   minimum separation over the same window is 0.0149 and the eigenvalues are
+#   accurate to ~1e-5, so the crossing is resolved with a margin of ~1500 and
+#   the along-contour step converges under refinement. There is no unresolvable
+#   crossing, no sheet exchange, and no need to indent L. The first v5.1 run
+#   stopped at iteration 14 on the tear detector; that detector was right to
+#   fire, and what it was detecting was the solver, not the flow.
 #
 # THE v5.1 CHANGES
 #   A. SYMMETRIC CONTOURS. Goertz Sec. 7.2.2: the inverse Fourier contour F is
@@ -86,12 +87,17 @@
 #      producing a torn curve for 1000 iterations as v5 did.
 #      The real cure is either the discretisation rewrite, or indenting L around
 #      omega* the way Briggs indents F around poles. Neither belongs in v5.1.
+#   F. NUM_MODES 150 -> 80. The one that actually mattered; details at the
+#      constant itself. Everything above (A-E) is still worth having, but the
+#      tear it was built to survive was a discretisation artefact.
 #   C. TEAR DETECTOR. maxstep_u/l = max along-contour |d alpha| per frame, AFTER
 #      refinement. Above tear_tol = 2*DA_MAX the run stops. v5 had no such check:
 #      track_path bisects flagged intervals up to max_refine times and then
 #      silently returns whatever it has, discarding the flags -- which is why a
 #      discontinuity survived 1000 iterations unreported. On the v5 data this
-#      fires at frame 15 (0.0347 > 0.024) with frame 14 clean (0.0037).
+#      fires at frame 15 (0.0347 > 0.024) with frame 14 clean (0.0037). With
+#      CHANGE F it should now stay quiet -- if it ever fires again, that is a
+#      real signal, and the first thing to re-check is the num_modes plateau.
 #   D. SEED BY PHYSICAL omega_r. v4.6/v5 used start_index = N/4, which on the
 #      one-sided grid [0, 0.5] happened to mean omega_r ~ 0.12. On the symmetric
 #      grid the same fraction lands at omega_r ~ -0.25. The seed is now given as
@@ -132,11 +138,11 @@
 #   1. RESOLUTION.  N = 100 -> 300, so the ribbon horizontals are sampled at
 #      d_omega_r = 0.5/299/n_sub = 8.4e-4, three times finer than the 1.25e-3 at
 #      which the continuation converged.  n_L: 570 -> 954, F: 100 -> 300 points.
-#      num_modes STAYS at 150 -- raising that makes things worse, because the
-#      coefficient-space Chebyshev recursion gives max|D4| ~ n^8 (1.4e15 at 100,
-#      3.7e16 at 150, 3.8e17 at 200) and at 220 the spectrum near alpha ~ 0.31
-#      is already garbage.  da_max is retightened 0.03 -> DA_MAX = 0.012 to
-#      match the new spacing; at 0.03 the guard was ~12x the typical step.
+#      num_modes: see CHANGE F below. The v5 header said "keep 150, raising it
+#      makes things worse". Half right: raising it is bad, but so is 150. The
+#      converged plateau is nm = 50..100 and 150 carries 5.5e-3 of error.
+#      da_max is retightened 0.03 -> DA_MAX = 0.012 to match the new spacing;
+#      at 0.03 the guard was ~12x the typical step.
 #   2. FIXED-OMEGA CONSISTENCY CHECK.  The riser tops and the whole arc sit at
 #      omega values that never move, so alpha there MUST be identical in every
 #      frame.  fixedw_u/l measures exactly that against frame 1; above
@@ -275,7 +281,42 @@ begin
     @everywhere begin
         Re = 2000.0
         beta = 0.0 + 0.0 * im
-        num_modes = 150
+        # v5.1 CHANGE F -- THE REAL FIX. The coefficient-space Chebyshev
+        # recursion makes max|D4| grow like n^8 (1.4e15 at n=100, 3.7e16 at 150),
+        # so beyond a threshold the discretisation DIVERGES: extra modes buy
+        # round-off, not accuracy. Convergence of one eigenvalue of the crossing
+        # pair at omega = 0.15075 - 0.05422i:
+        #     nm =  50   0.34692327 - 0.01213617i
+        #     nm =  60   0.34692303 - 0.01213601i     <- plateau, spread 4e-7
+        #     nm =  70   0.34692327 - 0.01213612i
+        #     nm =  80   0.34692285 - 0.01213514i
+        #     nm = 100   0.34692320 - 0.01212789i
+        #     nm = 110   0.34719170 - 0.01184683i     err 3.9e-4
+        #     nm = 130   0.34728424 - 0.01193706i     err 4.1e-4
+        #     nm = 140   0.35001044 - 0.01209022i     err 3.1e-3
+        #     nm = 150   0.35221286 - 0.01057364i     err 5.5e-3   <- was used
+        # 150 sat 5.5e-3 away from the converged value. That error WAS the
+        # "eigenvalue noise floor" that made the branch crossing look
+        # unresolvable, and every conclusion drawn from it was wrong:
+        #   - the branches near omega ~ 0.148 - 0.050i do NOT close to 0.0027.
+        #     At nm = 80 the minimum separation over the same window is 0.0149,
+        #     resolved with a margin of ~1500 against the 1e-5 accuracy there.
+        #     It is a real, ordinary avoided crossing, and it is trackable.
+        #   - the tear was not a physical branch exchange. At nm = 80 the max
+        #     along-contour step across the crossing at v5.1's own spacing is
+        #     0.00375 (vs DA_MAX 0.012, tear_tol 0.024), and it CONVERGES under
+        #     refinement -- 0.00375 -> 0.00099 -> 0.00053 -> 0.00030 for
+        #     d omega_r refined 1x/4x/8x/16x, with max/median steady at 1.2-1.5.
+        #     At nm = 150 the same test gave 0.00637 -> 0.00654 -> 0.00863: the
+        #     step GREW with refinement, because it was sampling noise.
+        # Checks that 80 loses nothing: identical count of eigenvalues with
+        # |alpha| < 5 (23) at nm 80/100/120/150; alpha at the arc agrees to
+        # 5e-6 (0.41381153 at 80 vs 0.41381657 at 150); at the contour ends
+        # omega = +/-0.5 - 0.05i, nm 80 and 120 agree to 1.2e-5. The 160x160
+        # pencil is also ~6x cheaper to solve than the 300x300 one.
+        # If you change this, re-run the plateau test first -- do not assume
+        # more modes is more accurate for a 4th-order operator built this way.
+        num_modes = 80
         start = 0
         terminate = 1
         v_g = 0.0 + 0.0 * im
@@ -1886,7 +1927,7 @@ for k = 1:n_iterations
         if maxstep_u > tear_tol || maxstep_l > tear_tol
             stop_after_save = true
             stop_reason = @sprintf(
-                "TEAR: branch discontinuous along the contour -- max along-contour step %.3e (upper) / %.3e (lower) exceeds %.3g after refinement. The tracked curve is on two different branches at once; this is what an unresolvable branch crossing looks like (v5 hit one at omega ~ 0.148-0.050i, where the branches close to 0.0027 while the discretisation resolves only 5e-3..1.5e-2). Fix the eigenvalue solver, or indent L around the crossing.",
+                "TEAR: branch discontinuous along the contour -- max along-contour step %.3e (upper) / %.3e (lower) exceeds %.3g after refinement. The tracked curve is on two different branches at once. Before blaming the flow, check the discretisation: in v5.1 the identical symptom came from num_modes = 150 sitting past the divergent threshold of the coefficient-space Chebyshev recursion (5.5e-3 error, vs 1e-5 on the nm = 50..100 plateau). Re-run the num_modes plateau test at the omega where this fired.",
                 maxstep_u, maxstep_l, tear_tol)
         end
 
