@@ -1,7 +1,7 @@
 # Kilian Vinzenz Wilhelm
 begin
     using Distributed, Plots, BenchmarkTools, FFTW, JSON, Statistics, Printf
-    addprocs(7)
+    addprocs(5)
     w = workers()
 end
 begin
@@ -742,7 +742,7 @@ function print_block(title)
     flush(stdout)
 end
 #
-for k = 1:1500
+for k = 1:700
     #print_iteration_header(k)
     global omega_i, L, alpha_L_u, alpha_L_l, alpha_i, F, omega_F, iteration_step
     local dict_to_JSON, current_array
