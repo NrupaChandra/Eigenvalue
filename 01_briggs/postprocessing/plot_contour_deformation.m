@@ -1,5 +1,5 @@
 
-data = read_contour_integration_json('contour_iteration_v4.2_ribbon.json');
+data = read_contour_integration_json('contour_iteration_v5.json');
 
 %% Video
 
@@ -38,7 +38,7 @@ alpha_xlim = alpha_xlim + margin * diff(alpha_xlim) * [-1, 1];
 alpha_ylim = alpha_ylim + margin * diff(alpha_ylim) * [-1, 1];
 
 
-make_contour_video('contour_iteration_v4.2_ribbon.json', 'contour_video_vibribbon_v4.2.mp4', omega_xlim, omega_ylim, alpha_xlim, alpha_ylim)
+make_contour_video('contour_iteration_v5.json', 'contour_video_v5.mp4', omega_xlim, omega_ylim, alpha_xlim, alpha_ylim)
 
 %% Load JSON
 function data = read_contour_integration_json(filename)

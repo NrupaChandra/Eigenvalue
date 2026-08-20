@@ -1,7 +1,7 @@
     # Kilian Vinzenz Wilhelm
     begin
         using Distributed, Plots, BenchmarkTools, FFTW, JSON, Printf, Statistics
-        addprocs(7)
+        addprocs(3)
         w = workers()
     end
     begin

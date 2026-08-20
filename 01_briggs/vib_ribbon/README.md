@@ -15,8 +15,8 @@ unchanged** — the ribbon just fixes ω to a real forcing frequency ω_f.
 
 ## Folder structure
 
-- `src/` — `briggsv4_ribbon.jl`, `briggsv4.1_ribbon.jl`, `briggsv4.2_ribbon.jl`,
-  `briggsv4.3_ribbon.jl`
+- `src/` — `briggsv4_ribbon.jl` … `briggsv4.6_ribbon.jl`, `briggsv5_ribbon.jl`
+- `analysis/` — post-mortem scripts for the v4.6 run (`ANALYSIS_v4.6.md` at folder level)
 - `postprocessing/` — `plot_contour_deformation_ribbon.m` (video renderer for the
   v4.2/v4.3 JSON; no exact-pinch markers, overlays the descent branches in gray)
 - `results/` — output JSON (`contour_iteration_v4.1_ribbon.json`) and animation
@@ -161,8 +161,94 @@ No value is copied; every α still comes from this script's own freshly solved s
 Diagnostics per frame: `xcheck_u/l` (red vs grey at identical ω, not forced to zero),
 `sideclass_u/l`, `nfallb_u/l`, `loop_mono_u/l` (monodromy of the closed detour).
 
-Output: `contour_iteration_v4.5_ribbon.json`. Render with
+Output: `contour_iteration_v4.5_ribbon.json`.
+
+> **v4.5 findings (both branches verified with an independent Python OS solver, matching the
+> Julia spectra to 1e-7):** the tracking is clean — red ≡ grey to 1e-6 on the left horizontal,
+> zero side-fallbacks, and pure continuation over the detour reproduces v4.5's values to
+> 1.5e-6. The red/grey disagreement after the detour (up to 2.85) is **real monodromy**: a
+> branch point of α(ω) sits inside the detour strip at ω ≈ 0.25 − 0.05i (`loop_mono_u`
+> switches on at exactly ω_i = −0.051). The ribbon contour passes *over* it, the straight
+> contour *under* it — two different sheets, both correct. Three sheets checked; only one
+> pair swaps. **Consequence:** the straight-line loop and the ribbon loop are genuinely
+> different problems, which motivates v4.6.
+
+**`briggsv4.6_ribbon.jl`** — **the closed loop.** The ribbon contour is *inside* the
+spatial↔temporal iteration: F → (temporal OS) → ω_F bounds the descent of L = ribbon contour
+→ (spatial OS, tracked) → α_u, α_l → potential Φ → deforms F → … The ribbon's branches —
+detour excursions and sheet change included — now steer the pinch search; ω_f is no longer
+cosmetic. Descent *theory* unchanged (same Φ, dynamics, acceptance rules, pinch criterion);
+what changed is geometry + mechanism:
+
+1. `contour_L()` **is** `hankel_L(omega_i)`; trial contours are ribbon contours;
+2. in-loop branches from the v4.5 tracker via `ribbon_branches()` (interior seed by the
+   side-of-F rule, side filter, secant predictor, separation guard, adaptive bisection) —
+   `contour_alpha_L_conti` is dead code (it was the old per-point matcher that fed
+   mode-hopping noise into Φ in the abandoned `briggsv4_ribbon.jl`);
+3. ω-level update evaluated on the ribbon's horizontal nodes (the level belongs to them);
+4. Φ_F endpoint indexing `N` → `end` (branches have n_L = 570 points);
+5. `branch_distance` is the **pairwise** minimum (elementwise pairing is meaningless on the
+   ribbon); `pinch_tol` applies to that;
+6. diagnostics per frame: `sideclass_u/l`, `nfallb_u/l`, `loop_mono_u/l`, refinement counts.
+   No descent overlay — there is no straight-line run to compare against.
+
+Same parameters as v4.5 (ω_f = 0.25, r_arc = 0.01, 300 iterations). Output:
+`contour_iteration_v4.6_ribbon.json`. Render with
 `postprocessing/plot_contour_deformation_ribbon.m`.
+
+**`briggsv5_ribbon.jl`** — v4.6 with the four fixes from the v4.6 post-mortem
+(`../ANALYSIS_v4.6.md`). **No physics changed**: same potential functions, same descent
+dynamics, same acceptance rules, same branch definition, same ribbon geometry. What changed
+is resolution, verification, and what the run reports.
+
+The v4.6 diagnosis in one line: the upper branch hopped at iteration 14 on the **left
+horizontal** at ω_r ≈ 0.146 — upstream of the detour — and iterations 14–1001 (98.7 % of the
+run) were on the wrong branch. Not the side-of-F filter (removing it reproduces the same
+values to 4 decimals, zero fallbacks) and not a branch point (the closed ω-rectangle spanning
+the two levels has monodromy 0.0844 at the run's spacing and exactly 0.00000 once refined) —
+just under-resolution:
+
+| nodes on the left horizontal | α at ω = 0.24 − 0.05130i |
+|---|---|
+| 48 (v4.6, Δω_r = 2.53e−3) | 0.65360 + 0.08051i ← what v4.6 got |
+| 96 (Δω_r = 1.25e−3) | 0.40647 + 0.00375i |
+| 192 (Δω_r = 6.2e−4) | 0.40647 + 0.00375i (converged) |
+
+1. **Resolution.** `N` 100 → 300, so the ribbon horizontals sit at Δω_r = 8.4e−4, three times
+   finer than the 1.25e−3 at which the continuation converged. `n_L` 570 → 954, F 100 → 300.
+   **`num_modes` stays at 150** — raising it makes things worse: the coefficient-space
+   Chebyshev recursion gives max|D4| ~ n⁸ (1.4e15 at 100, 3.7e16 at 150, 3.8e17 at 200) and at
+   220 the spectrum near α ≈ 0.31 is already garbage. `da_max` 0.03 → `DA_MAX = 0.012`, since
+   at 0.03 the guard sat ~12× above the typical step and never fired (the hop was accepted
+   with a step of 0.0151).
+2. **Fixed-ω consistency check** (`fixedw_u/l`). The riser tops and the whole arc are at ω
+   values that never move, so α there must be identical in every frame. Measured against
+   frame 1; above `fixed_tol = 1e-8` the run stops, because a hop has occurred upstream and
+   every later frame is meaningless. This is the v4.2 "decisive test" reinstated — it would
+   have caught iteration 14 at once, and it is worth more than all four v4.6 diagnostics,
+   every one of which passed while the branch hopped.
+3. **Short run.** 1000 → `n_iterations = 60`. In v4.6 α at the arc took exactly **two** values
+   over 1001 frames, because the arc sits at fixed ω. A long descent adds nothing.
+4. **Ribbon reporting instead of pinch termination.** Per Görtz §7.2.4, for a harmonic source
+   at real ω₀ the response is the residue at that pole — harmonic in time, with the spatial
+   behaviour set by α_u(ω₀) for x > d and α_l(ω₀) for x < −d — and the verdict is a **sign
+   test** on Im α, not a collision test. The run now prints α_u(ω_f), α_l(ω_f), the
+   Im α = 0 crossing counts and the resulting verdict. `pinch_tol` is kept only as the
+   **absolute-instability alarm**: a pinch with Im ω > 0 would invalidate the ribbon argument
+   entirely. (In v4.6 `branch_distance` went 3.31 → 2.19 against 1e−4 — unreachable, because
+   below F there is nothing but the wall ladder at −3.33i, −6.57i, …)
+
+Plus an optional **grid-convergence check** (`gridconv_u/l`, every `grid_check_every = 10`
+iterations): the same contour retracked at `grid_check_mult` × the sampling and compared at
+the coincident nodes — the direct measure of the v4.6 failure mode.
+
+New per-frame JSON fields: `fixedw_u/l`, `gridconv_u/l`, `alpha_u_wf`, `alpha_l_wf`,
+`ncross_u/l`, `omega_i`, `n_L`. Output: `contour_iteration_v5_ribbon.json`.
+
+> **Not fixed in v5** (needs a bigger rewrite, see `ANALYSIS_v4.6.md` §5): the n⁸ conditioning
+> of the D3/D4 recursion, which leaves the eigenvalues near α ≈ 0.31 uncertain by about their
+> own separation; F being dragged bodily down to Im α ≈ −1.15 instead of staying a deformation
+> of the real axis; the radius-7 rolling average applied to F every iteration.
 
 All use Re = 2000, β = 0, num_modes = 150 and run in parallel via `Distributed`
 (`addprocs(31)` — reduce for local runs).

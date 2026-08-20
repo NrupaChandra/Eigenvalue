@@ -15,10 +15,16 @@
 % there), so agreement meant nothing. They are now computed separately and are
 % NOT forced to agree -- if they part company, that is a result, not a bug.
 
-jsonfile   = 'contour_iteration_v4.5_ribbon.json';
-outputfile = 'contour_video4.5_ribbon.mp4';
+% v4.6 note: the JSON has no *_descent fields (the loop is closed on the ribbon
+% contour, there is no straight-line descent any more). The grey overlay below
+% skips automatically when those fields are absent.
+
+jsonfile   = 'contour_iteration_v4.6_ribbon.json';
+outputfile = 'contour_video4.6_ribbon.mp4';
 
 % previous runs:
+% jsonfile   = 'contour_iteration_v4.5_ribbon.json';
+% outputfile = 'contour_video4.5_ribbon.mp4';
 % jsonfile   = 'contour_iteration_v4.4_ribbon.json';
 % outputfile = 'contour_video4.4_ribbon.mp4';
 % jsonfile   = 'contour_iteration_v4.3_ribbon_repaired.json';

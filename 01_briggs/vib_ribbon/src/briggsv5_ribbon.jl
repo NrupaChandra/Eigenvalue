@@ -52,6 +52,51 @@
 #      would invalidate the whole ribbon argument).  In v4.6 branch_distance
 #      went 3.31 -> 2.19 against pinch_tol = 1e-4: unreachable here, because
 #      below F there is nothing but the wall ladder at -3.33i, -6.57i, ...
+#   5. FRAME-TO-FRAME CONTINUITY (added after the first v5 run, which still
+#      hopped at iteration 14 even at N=300 -- refining the contour was not
+#      enough).  Diagnosis, from the 15-frame v5 JSON:
+#        - frames 14 and 15 are BOTH smooth (max step 0.0037 / 0.0039 against
+#          DA_MAX = 0.012) and both consist of genuine eigenvalues.  Neither
+#          jumps: the two curves drift apart gradually from the seed onwards.
+#        - the two branches involved NEVER collide.  Minimum separation 0.036
+#          over omega_r in [0.12,0.20] x omega_i in [-0.046,-0.060].  So there
+#          is no branch point and the continuation is not ambiguous in
+#          principle -- the tracker simply loses it.
+#        - continuing alpha VERTICALLY from frame 14's value down to frame 15's
+#          level settles which is right:
+#             omega_r = 0.12375  0.26367-0.04141i -> 0.26815-0.05078i
+#                                frame 15: 0.26725-0.05057i   agrees to 9e-4
+#             omega_r = 0.15050  0.30095+0.00000i -> 0.30329+0.00108i
+#                                frame 15: 0.34548-0.01060i   differs by 0.044
+#             omega_r = 0.24000  0.40660+0.00568i -> 0.40725-0.00015i
+#                                frame 15: 0.65700+0.07157i   differs by 0.260
+#          with a max step of 0.0008 on that vertical.  The seed is right, the
+#          endpoint is wrong.
+#      The fix uses the one piece of information the tracker had and ignored:
+#      each frame re-seeded from scratch and tracked along the contour with no
+#      memory of the previous frame.  But between frames every node moves by at
+#      most |d omega_i| ~ 4e-3 (horizontals shift by exactly that, riser nodes by
+#      less, the arc not at all), and the branch moves by <= 1.1e-2 -- against a
+#      branch separation of >= 3.6e-2.  So the previous frame's alpha at the SAME
+#      node index is a much better predictor than the along-contour secant, with
+#      a factor-3 margin.  continue_branch() uses it where available and falls
+#      back to the secant otherwise.  This also removes the v4.4-style seed-flip
+#      risk, since the seed node is predicted the same way.
+#      IMPORTANT: prev is applied ONLY on the horizontals (mask_to_horizontals).
+#      The risers and the arc are deliberately left on the secant, because their
+#      omega is pinned -- if prev drove them too, alpha there would reproduce
+#      frame 1 BY CONSTRUCTION and fixedw_u/l could never fail.  As it stands
+#      they are reached by continuation from the prev-anchored end of the
+#      horizontal, so fixedw still tests the thing that actually broke.
+#      Verified against the v5 frame-15 data: with prev on the horizontal the
+#      endpoint at omega_r = 0.24 comes out 0.406956+0.000022i (truth
+#      0.40725-0.00015i, error 3.4e-4) instead of 0.656941+0.071618i, and the
+#      riser+arc traverse from there lands on 0.414044+0.089296i against
+#      frame 1's 0.413445+0.088846i.
+#      Also reported: framedev_u/l = max |alpha_new - alpha_prev| on the
+#      horizontals, with a WARN above DFRAME_MAX.  That is a report, not a test
+#      -- it can be masked if the true branch genuinely moves a long way.
+#
 #   Plus, cheap and optional: a GRID-CONVERGENCE check (grid_check_every) that
 #   retracks the same contour with every segment refined by grid_check_mult and
 #   compares at the coincident nodes.  gridconv_u/l measures the v4.6 failure
@@ -113,7 +158,7 @@
 # Kilian Vinzenz Wilhelm
 begin
     using Distributed, Plots, BenchmarkTools, FFTW, JSON, Statistics, Printf
-    addprocs(31)
+    addprocs(7)
     w = workers()
 end
 begin
@@ -838,9 +883,15 @@ end
 # terms. Rejected intervals are bisected and re-solved, so a tighter guard costs
 # accuracy nothing -- only time.
 const DA_MAX = 0.012
+# v5 CHANGE 5: how far a node's alpha may move between two consecutive frames
+# before it is worth flagging. Measured on the v5 run: the true motion for
+# d omega_i = 4e-3 is <= 1.1e-2, while the nearest rival branch is >= 3.6e-2
+# away, so 0.02 sits comfortably between the two.
+const DFRAME_MAX = 0.02
 
 function continue_branch(nodes, spectra, sides, seed, branch_side;
-                         da_max = DA_MAX, sep_frac = 0.6, side_tol = 0.0)
+                         da_max = DA_MAX, sep_frac = 0.6, side_tol = 0.0,
+                         prev = nothing)
     n = length(nodes)
     vals = Vector{ComplexF64}(undef, n)
     flag = falses(n)
@@ -859,6 +910,14 @@ function continue_branch(nodes, spectra, sides, seed, branch_side;
                 abs(disp) > da_max && (disp *= da_max / abs(disp))
                 pred = a_prev + disp
             end
+        end
+        # v5 CHANGE 5: the previous frame's value at THIS node beats the
+        # along-contour secant. Every node moves by at most |d omega_i| between
+        # frames, so prev[j] is within ~1.1e-2 of the truth, while the nearest
+        # rival branch is >= 3.6e-2 away. Frame 1 has no prev and falls back to
+        # the secant, which is what defines the branch for the whole run.
+        if prev !== nothing && isfin(prev[j])
+            pred = prev[j]
         end
         evs = spectra[j]; sd = sides[j]
         if isempty(evs) || !isfin(pred)
@@ -898,14 +957,16 @@ end
 # Track one path, bisecting every rejected interval and re-solving the inserted
 # nodes in a single parallel batch. Values are returned at the ORIGINAL nodes only.
 function track_path(nodes0, spectra0, sides0, seed, branch_side;
-                    max_refine = 4, node_cap = 4000, da_max = DA_MAX, sep_frac = 0.6)
+                    max_refine = 4, node_cap = 4000, da_max = DA_MAX, sep_frac = 0.6,
+                    prev = nothing)
     nodes   = copy(nodes0)
     spectra = Vector{Vector{ComplexF64}}(spectra0)
     sides   = Vector{Vector{Float64}}(sides0)
+    pv      = prev === nothing ? nothing : ComplexF64.(collect(prev))
     is_orig = trues(length(nodes))
     n_added = 0
     vals, flag, nfb = continue_branch(nodes, spectra, sides, seed, branch_side;
-                                      da_max = da_max, sep_frac = sep_frac)
+                                      da_max = da_max, sep_frac = sep_frac, prev = pv)
     for _ in 1:max_refine
         ins_at = Int[]; ins_w = ComplexF64[]
         for j in 2:length(nodes)
@@ -920,25 +981,32 @@ function track_path(nodes0, spectra0, sides0, seed, branch_side;
         n_added += length(ins_w)
         nn = ComplexF64[]; ss = Vector{Vector{ComplexF64}}()
         vv = Vector{Vector{Float64}}(); oo = Bool[]
+        pp = pv === nothing ? nothing : ComplexF64[]
         p = 1
         for j in 1:length(nodes)
             while p <= length(ins_at) && ins_at[p] == j
-                push!(nn, ins_w[p]); push!(ss, new_spec[p]); push!(vv, new_sides[p]); push!(oo, false); p += 1
+                push!(nn, ins_w[p]); push!(ss, new_spec[p]); push!(vv, new_sides[p]); push!(oo, false)
+                # inserted nodes sit midway, so predict midway too
+                pv === nothing || push!(pp, 0.5 * (pv[j-1] + pv[j]))
+                p += 1
             end
             push!(nn, nodes[j]); push!(ss, spectra[j]); push!(vv, sides[j]); push!(oo, is_orig[j])
+            pv === nothing || push!(pp, pv[j])
         end
-        nodes = nn; spectra = ss; sides = vv; is_orig = oo
+        nodes = nn; spectra = ss; sides = vv; is_orig = oo; pv = pp
         vals, flag, nfb = continue_branch(nodes, spectra, sides, seed, branch_side;
-                                          da_max = da_max, sep_frac = sep_frac)
+                                          da_max = da_max, sep_frac = sep_frac, prev = pv)
     end
     return vals[is_orig], n_added, nfb
 end
 
 # (A) March OUTWARD from an interior seed node, both directions -- the protocol of
 # contour_alpha_L_conti(), which starts at N/4 rather than at a contour end.
-function track_outward(nodes, spectra, sides, i_seed, seed, branch_side)
-    vf, af, nf = track_path(nodes[i_seed:end],    spectra[i_seed:end],    sides[i_seed:end],    seed, branch_side)
-    vb, ab, nb = track_path(nodes[i_seed:-1:1],   spectra[i_seed:-1:1],   sides[i_seed:-1:1],   seed, branch_side)
+function track_outward(nodes, spectra, sides, i_seed, seed, branch_side; prev = nothing)
+    pf = prev === nothing ? nothing : prev[i_seed:end]
+    pb = prev === nothing ? nothing : prev[i_seed:-1:1]
+    vf, af, nf = track_path(nodes[i_seed:end],    spectra[i_seed:end],    sides[i_seed:end],    seed, branch_side; prev = pf)
+    vb, ab, nb = track_path(nodes[i_seed:-1:1],   spectra[i_seed:-1:1],   sides[i_seed:-1:1],   seed, branch_side; prev = pb)
     vals = vcat(reverse(vb[2:end]), vf)          # vb[1] and vf[1] are the same node
     return vals, af + ab, nf + nb
 end
@@ -992,19 +1060,46 @@ last_track_diag = (0, 0, 0, 0)
 # v5: the body of v4.6's ribbon_branches, with the seed index passed in and the
 # module globals NOT touched, so it can also be called on a refined contour by
 # the grid-convergence check without clobbering the frame diagnostics.
-function track_on_contour(Lc, i_seed)
+function track_on_contour(Lc, i_seed; prev_u = nothing, prev_l = nothing)
     spectra = pmap(spatial_spectrum, Lc)
     sides   = [side_projections(sp, F, normals_F) for sp in spectra]
     su, sl  = classify_by_F(spectra[i_seed], sides[i_seed], F)
     seed_u  = seed_or_nearest(su, spectra[i_seed], F)
     seed_l  = seed_or_nearest(sl, spectra[i_seed], F)
-    au, add_u, nfb_u = track_outward(Lc, spectra, sides, i_seed, seed_u, :upper)
-    al, add_l, nfb_l = track_outward(Lc, spectra, sides, i_seed, seed_l, :lower)
+    au, add_u, nfb_u = track_outward(Lc, spectra, sides, i_seed, seed_u, :upper; prev = prev_u)
+    al, add_l, nfb_l = track_outward(Lc, spectra, sides, i_seed, seed_l, :lower; prev = prev_l)
     return au, al, spectra, sides, (add_u, nfb_u, add_l, nfb_l)
 end
 
+# v5 CHANGE 5: the previous accepted frame's branches, used as the predictor.
+# Empty on frame 1 (falls back to the along-contour secant); ignored on a
+# refined contour, where the lengths do not match.
+prev_alpha_u = ComplexF64[]
+prev_alpha_l = ComplexF64[]
+framedev_u = 0.0
+framedev_l = 0.0
+
+# The prev-frame predictor is applied ONLY on the horizontals. The risers and
+# the arc are left to along-contour continuation on purpose: their omega is
+# pinned (exactly, for the arc), so if prev drove them too, alpha there would
+# reproduce frame 1 BY CONSTRUCTION and fixedw_u/l could never fail -- the
+# "a good check is one that can fail" rule. Left as is, they are reached by
+# continuation from the prev-anchored end of the horizontal, so fixedw genuinely
+# tests whether the horizontal ended up on the right branch, which is the
+# failure mode that broke v4.6 and the first v5 run. prev buys little there
+# anyway: riser nodes move by at most d omega_i and the arc not at all.
+function mask_to_horizontals(p)
+    p === nothing && return nothing
+    q = fill(ComplexF64(NaN, NaN), length(p))
+    q[1:n_hl] .= p[1:n_hl]
+    q[(off_hr + 1):end] .= p[(off_hr + 1):end]
+    return q
+end
+
 function ribbon_branches(Lc)
-    au, al, spectra, sides, diag = track_on_contour(Lc, i_seed_coarse)
+    pu = length(prev_alpha_u) == length(Lc) ? mask_to_horizontals(prev_alpha_u) : nothing
+    pl = length(prev_alpha_l) == length(Lc) ? mask_to_horizontals(prev_alpha_l) : nothing
+    au, al, spectra, sides, diag = track_on_contour(Lc, i_seed_coarse; prev_u = pu, prev_l = pl)
     global last_spectra = spectra
     global last_sides = sides
     global last_track_diag = diag
@@ -1019,6 +1114,27 @@ end
 # what happened at v4.6 iteration 14, where the arc value moved from
 # 0.413445+0.088846i to 0.552821+0.255033i and then stayed wrong for 987 more
 # iterations while every other diagnostic looked healthy).
+# How far the branches moved since the last accepted frame. INFORMATIONAL
+# ONLY -- with prev as the predictor this is small by construction, so it is a
+# report, not a test. The independent test is fixedw_u/l below, which compares
+# against frame 1 at nodes whose omega never moves.
+function frame_deviation!()
+    if !isempty(prev_alpha_u) && length(prev_alpha_u) == length(alpha_L_u)
+        hor = vcat(collect(1:n_hl), collect((off_hr + 1):length(alpha_L_u)))
+        global framedev_u = maximum(abs.(ComplexF64.(alpha_L_u[hor]) .- prev_alpha_u[hor]))
+        global framedev_l = maximum(abs.(ComplexF64.(alpha_L_l[hor]) .- prev_alpha_l[hor]))
+    else
+        global framedev_u = 0.0
+        global framedev_l = 0.0
+    end
+    return framedev_u, framedev_l
+end
+function commit_frame_branches!()
+    global prev_alpha_u = ComplexF64.(alpha_L_u)
+    global prev_alpha_l = ComplexF64.(alpha_L_l)
+    return nothing
+end
+
 fixedw_ref_u = ComplexF64[]
 fixedw_ref_l = ComplexF64[]
 fixedw_u = 0.0
@@ -1093,9 +1209,13 @@ function make_ribbon_frame(iter)
     ncr_l = n_axis_crossings(alpha_L_l)
     @printf("        ribbon: side=%.3e/%.3e mono=%.3e/%.3e | refined u=%d l=%d | side-fallbacks u=%d l=%d\n",
             scu, scl, loop_mono_u, loop_mono_l, add_u, add_l, nfb_u, nfb_l)
-    @printf("        v5    : fixed-omega=%.3e/%.3e | gridconv=%.3e/%.3e | alpha(omega_f)=%+.6f%+.6fi / %+.6f%+.6fi | Im-crossings u=%d l=%d\n",
-            fixedw_u, fixedw_l, gridconv_u, gridconv_l,
+    @printf("        v5    : fixed-omega=%.3e/%.3e | gridconv=%.3e/%.3e | framedev=%.3e/%.3e | alpha(omega_f)=%+.6f%+.6fi / %+.6f%+.6fi | Im-crossings u=%d l=%d\n",
+            fixedw_u, fixedw_l, gridconv_u, gridconv_l, framedev_u, framedev_l,
             real(a_u_wf), imag(a_u_wf), real(a_l_wf), imag(a_l_wf), ncr_u, ncr_l)
+    if framedev_u > DFRAME_MAX || framedev_l > DFRAME_MAX
+        @printf("        WARN  : framedev %.3e/%.3e exceeds DFRAME_MAX=%.3g -- the branch moved further in one omega_i step than expected (measured max 1.7e-2). Consider a smaller omega step.\n",
+                framedev_u, framedev_l, DFRAME_MAX)
+    end
     flush(stdout)
     return Dict(
         "iteration" => iter,
@@ -1111,6 +1231,7 @@ function make_ribbon_frame(iter)
         # ---- v5 fields ----
         "fixedw_u"    => jsonnum(fixedw_u),   "fixedw_l"   => jsonnum(fixedw_l),
         "gridconv_u"  => jsonnum(gridconv_u), "gridconv_l" => jsonnum(gridconv_l),
+        "framedev_u"  => jsonnum(framedev_u), "framedev_l" => jsonnum(framedev_l),
         "alpha_u_wf"  => Dict("re" => real(a_u_wf), "im" => imag(a_u_wf)),
         "alpha_l_wf"  => Dict("re" => real(a_l_wf), "im" => imag(a_l_wf)),
         "ncross_u"    => ncr_u,       "ncross_l"    => ncr_l,
@@ -1162,6 +1283,7 @@ begin
     # v4.6: compute the tracked ribbon branches before the first frame.
     alpha_L_u, alpha_L_l = ribbon_branches(L)
     load_on_workers()
+    frame_deviation!()            # v5: zero on frame 1 (there is no previous)
     fixed_omega_check!()          # v5: take the fixed-omega reference from frame 1
     grid_convergence_check!()     # v5: and one convergence check straight away
     @printf("v5 setup: N=%d, n_L=%d, horizontal d(omega_r)=%.3e, DA_MAX=%.3g, num_modes=%d\n",
@@ -1169,6 +1291,7 @@ begin
     frame_writer = open_frame_writer(filename)
     last_frame = make_ribbon_frame(iteration_step)
     write_frame!(frame_writer, last_frame)
+    commit_frame_branches!()      # v5: frame 1 becomes the predictor for frame 2
     iteration_step += 1
 end
 function branch_distance(alpha_L_u, alpha_L_l)
@@ -1664,8 +1787,10 @@ for k = 1:n_iterations
         )
         flush(stdout)
         load_on_workers()
+        frame_deviation!()        # v5: measure BEFORE prev is overwritten
         global last_frame = make_ribbon_frame(iteration_step)
         write_frame!(frame_writer, last_frame)
+        commit_frame_branches!()  # v5: this frame becomes the next predictor
         global iteration_step += 1
 
         if stop_after_save
@@ -1708,8 +1833,9 @@ begin
     println(imag(a_l_wf) > 0.0 ?
         "  => alpha_l has crossed the real alpha axis: spatially AMPLIFYING for x < -d" :
         "  => alpha_l has NOT crossed the real alpha axis: no upstream growth")
-    @printf("verification: fixed-omega %.3e / %.3e (tol 1e-8), grid convergence %.3e / %.3e\n",
-            fixedw_u, fixedw_l, gridconv_u, gridconv_l)
+    @printf("verification: fixed-omega %.3e / %.3e (tol 1e-8, the independent check)\n", fixedw_u, fixedw_l)
+    @printf("              grid convergence %.3e / %.3e, frame deviation %.3e / %.3e (informational)\n",
+            gridconv_u, gridconv_l, framedev_u, framedev_l)
     @printf("absolute-instability alarm: min pairwise |alpha_u - alpha_l| = %.4e (pinch_tol = 1e-4)\n",
             branch_distance(alpha_L_u, alpha_L_l))
     println("==============================================")
