@@ -1382,6 +1382,7 @@ for k = 1:2000
             rhs_j =
                 (
                     alpha_i_r * d_d_alpha_r_Phi_F(F[j])
+                    
                     - d_d_alpha_i_Phi_F(F[j])
                     + sigma * alpha_i_rr
                 ) / (1.0 + alpha_i_r^2)

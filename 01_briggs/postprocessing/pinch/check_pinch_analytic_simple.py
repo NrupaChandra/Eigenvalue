@@ -29,7 +29,7 @@ import mpmath
 # USER SETTINGS
 # =====================================================================
 
-PINCH_JSON = r"C:\Git\Eigenvalue\01_briggs\results\json\contour_iteration_v4.2_pinch.json"
+PINCH_JSON = r"C:\Git\Eigenvalue\01_briggs\results\json\contour_iteration_v4.2_pinch_simple.json"
 
 PRECISION_DECIMAL_POINTS = 40
 DEFAULT_RE = 2000.0
