@@ -1,5 +1,5 @@
 """
-check_pinch_exact_analytic.py
+check_pinch_analytic_simple.py
 
 The two analytical Python functions below are copied directly from the
 original Julia/PyCall source:
@@ -10,15 +10,15 @@ original Julia/PyCall source:
 They are intentionally left unchanged.
 
 This script only adds a small wrapper at the bottom which:
-  1. reads alpha_p and omega_p from the pinch JSON,
+  1. reads alpha_p and omega_p from the compute_pinch.py output JSON,
   2. evaluates the analytical dispersion relation D(alpha_p, omega_p),
-  3. evaluates the analytical group velocity dω/dα,
+  3. evaluates the analytical group velocity domega/dalpha,
   4. prints the results.
 
 For a pinch / saddle point we expect:
 
-    D(alpha_p, omega_p) ≈ 0
-    dω/dα               ≈ 0
+    D(alpha_p, omega_p) = 0
+    domega/dalpha       = 0
 """
 
 import json
@@ -32,11 +32,10 @@ import mpmath
 PINCH_JSON = r"C:\Git\Eigenvalue\01_briggs\results\json\contour_iteration_v4.2_pinch_simple.json"
 
 PRECISION_DECIMAL_POINTS = 40
-DEFAULT_RE = 2000.0
 
 
 # =====================================================================
-# EXACT ANALYTICAL DISPERSION-RELATION FUNCTION FROM ORIGINAL SCRIPT
+# ANALYTICAL DISPERSION-RELATION FUNCTION FROM ORIGINAL SCRIPT
 # =====================================================================
 
 def fnum_python(a, omega, re, precision_decimal_points_py):
@@ -94,7 +93,7 @@ def fnum_python(a, omega, re, precision_decimal_points_py):
 
 
 # =====================================================================
-# EXACT ANALYTICAL DERIVATIVE FUNCTION FROM ORIGINAL SCRIPT
+# ANALYTICAL DERIVATIVE FUNCTION FROM ORIGINAL SCRIPT
 # =====================================================================
 
 def fnum_derivatives_python(a, omega, re, precision_decimal_points_py):
@@ -234,28 +233,28 @@ def fnum_derivatives_python(a, omega, re, precision_decimal_points_py):
             error_d_ina0_d_a)
 
 
-# =====================================================================
-# EVERYTHING BELOW THIS LINE IS ONLY THE NEW VALIDATION WRAPPER
-# =====================================================================
-
 with open(PINCH_JSON, "r") as f:
     pinch = json.load(f)
 
-Re = mpmath.mpf(repr(pinch.get("Re", DEFAULT_RE)))
+# compute_pinch.py writes the final pinch as the last entry of level_results
+# (the smallest circle), and Re inside "settings" -- not at the top level.
+result = pinch["level_results"][-1]
+
+Re = mpmath.mpf(repr(pinch["settings"]["Re"]))
 
 alpha_p = mpmath.mpc(
-    repr(pinch["alpha_p"]["re"]),
-    repr(pinch["alpha_p"]["im"])
+    repr(result["alpha_p"]["re"]),
+    repr(result["alpha_p"]["im"])
 )
 
 omega_p = mpmath.mpc(
-    repr(pinch["omega_p"]["re"]),
-    repr(pinch["omega_p"]["im"])
+    repr(result["omega_p"]["re"]),
+    repr(result["omega_p"]["im"])
 )
 
 
 print("=" * 72)
-print("ANALYTIC PINCH CHECK — ORIGINAL FUNCTIONS UNCHANGED")
+print("ANALYTIC PINCH CHECK - ORIGINAL FUNCTIONS UNCHANGED")
 print("=" * 72)
 
 print("\nInput pinch:")
@@ -264,24 +263,10 @@ print("omega_p =", omega_p)
 print("Re      =", Re)
 
 print("\nEvaluating original analytical dispersion relation...")
-D_result = fnum_python(
-    alpha_p,
-    omega_p,
-    Re,
-    PRECISION_DECIMAL_POINTS
-)
-
-D_value = D_result[0]
+D_value = fnum_python(alpha_p, omega_p, Re, PRECISION_DECIMAL_POINTS)[0]
 
 print("Evaluating original analytical derivative function...")
-derivative_result = fnum_derivatives_python(
-    alpha_p,
-    omega_p,
-    Re,
-    PRECISION_DECIMAL_POINTS
-)
-
-domega_dalpha = derivative_result[0]
+domega_dalpha = fnum_derivatives_python(alpha_p, omega_p, Re, PRECISION_DECIMAL_POINTS)[0]
 
 
 print("\nRESULTS")
@@ -298,4 +283,3 @@ print(domega_dalpha)
 print()
 print("|domega/dalpha| =")
 print(abs(domega_dalpha))
-
