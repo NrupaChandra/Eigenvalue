@@ -1,16 +1,35 @@
 # Kilian Vinzenz Wilhelm
-#This version has local finer discretization of the L contour
+
+# ---------------------------------------------------------------------------
+# v4.4  -- close the omega-plane gap between L and omega_F.
 #
-# v4.3a (fix only -- physics, discretization, potential and time stepping are
-# unchanged; the 200/200 refinement of L between omega_r_base[47..57..67] stays):
-#   1. expc()  caps the exponent of the alpha-side potential so that
-#      exp(zeta/(d^2+eps)) can no longer overflow to Inf and produce
-#      Inf - Inf = NaN in rhs_j.  This is what killed the run at k = 122
-#      (LAPACKException(150) = NaN operator handed to eigen).
-#   2. rhs_j: NaN-safe clamp.
-#   3. the alpha update is discarded (with a warning) if it is not finite.
-#   4. iteration budget 700 -> 2000 (v4.2 needed 690).
-#   5. RESUME switch so a long run can be continued instead of restarted.
+# PROBLEM in v4.3.  The omega update never aims at omega_F.  It builds one
+# candidate height per L point,
+
+# CHANGES
+#   1. BISECTION ENDGAME   After the existing candidate step,
+#      drive omega_i down towards omega_lower_bound by bisection, accepting the
+#      lowest height whose contour_alpha_L_conti + branch_overlap_valid still
+#      succeed.  Halves the gap per attempt: 1e-4 -> 1e-8 in ~14 tries.
+#      Switch: OMEGA_BISECT (set false to reproduce v4.3 behaviour exactly).
+#   2. omega_clearance 2e-7 -> 1e-9, so the target is not the limiter.
+#   3. min_useful_omega_jump and omega_dt_min 1e-8 -> 1e-12.  A step below 1e-8
+#      was rejected as "useless" and the run gave up, which made converging TO
+#      a 1e-8 gap impossible by construction.
+#   4. L GRID: 50 points per base cell over omega_r_base[54 .. 62]
+#      (dw_r = 1.031e-4, N_L = 484 vs 478).  omega_p is at omega_r = 0.2986491,
+#      13 % into cell [60,61], and the candidates that decide each step sit at
+#      omega_r in [0.285, 0.288]; base[54..62] = [0.2677, 0.3081] covers both.
+#   5. JSON: "omega_F_at_L" saved next to "omega_F".  omega_F is recomputed
+#      AFTER the alpha update, so the stored (L, omega_F) pair is one step out
+#      of sync and the plotted gap is not the one the algorithm controlled.
+#      omega_F_at_L is omega_F as it stood when L was placed.
+#   6. Per-iteration log line reports the achieved gap and what limited it.
+#
+# NOTE the dead term in the candidate loop (kept, see the comment there):
+# omega_i_vectorization is constant, so its central difference is identically
+# zero and the d_d_omega_r_Phi_L coupling never contributes.
+# ---------------------------------------------------------------------------
 
 begin
     using Distributed, Plots, BenchmarkTools, FFTW, JSON, Statistics, Printf
@@ -202,23 +221,46 @@ begin
         # Original coarse discretization
         omega_r_base = collect(range(omega_r_start, omega_r_end, length=100))
 
-        # Original points that define the locally refined region
-        omega_47 = omega_r_base[47]
-        omega_57 = omega_r_base[57]
-        omega_67 = omega_r_base[67]
+        # ------------------------------------------------------------------
+        # v4.4 local refinement: PTS_PER_CELL points spanning each base cell
+        # between omega_r_base[REFINE_LO] and omega_r_base[REFINE_HI].
+        #
+        #   base spacing                    = 5.0505e-3
+        #   base[54] = 0.2676768   base[62] = 0.3080808
+        #   refined spacing                 = 5.0505e-3 / 49 = 1.0307e-4
+        #   N_L                             = 53 + 393 + 38 = 484
+        #
+        # omega_p sits at omega_r = 0.2986491 (13 % into base cell [60,61]) and
+        # the candidates that decide the omega step sit at omega_r in
+        # [0.285, 0.288]; base[54..62] = [0.2677, 0.3081] brackets both.
+        # v4.3 was REFINE_LO=47, REFINE_HI=67, PTS_PER_CELL=21 (200 pts over
+        # 10 cells), i.e. dw_r = 2.5379e-4.
+        # ------------------------------------------------------------------
+        REFINE_LO    = 54
+        REFINE_HI    = 62
+        PTS_PER_CELL = 50      # points spanning one base cell, endpoints included
 
-        # Locally refined sections
-        omega_refined_47_57 = collect(range(omega_47, omega_57, length=200))
-        omega_refined_57_67 = collect(range(omega_57, omega_67, length=200))
+        # Build the refined block cell by cell, dropping the duplicated left
+        # endpoint of every cell after the first.
+        omega_refined = collect(range(omega_r_base[REFINE_LO],
+                                      omega_r_base[REFINE_LO + 1],
+                                      length = PTS_PER_CELL))
+        for c in (REFINE_LO + 1):(REFINE_HI - 1)
+            cell = collect(range(omega_r_base[c], omega_r_base[c + 1],
+                                 length = PTS_PER_CELL))
+            append!(omega_refined, cell[2:end])
+        end
 
-        # Assemble complete omega discretization
-        # Avoid duplicate points at 47, 57 and 67
+        # Assemble complete omega discretization.
+        # omega_refined already carries base[REFINE_LO] and base[REFINE_HI].
         omega_r = vcat(
-            omega_r_base[1:46],
-            omega_refined_47_57,
-            omega_refined_57_67[2:end],
-            omega_r_base[68:end]
+            omega_r_base[1:(REFINE_LO - 1)],
+            omega_refined,
+            omega_r_base[(REFINE_HI + 1):end]
         )
+
+        @assert issorted(omega_r)
+        @assert minimum(diff(omega_r)) > 0
 
         N_L = length(omega_r)
     end
@@ -377,13 +419,12 @@ begin
         global alpha_i = fill(0.0, N)
         global F = contour_F()
         global omega_F = contour_omega_F(F)
-        global omega_i = 0.0 
+        global omega_i = 0.0
         global omega_r = vcat(
-            omega_r_base[1:46],
-            omega_refined_47_57,
-            omega_refined_57_67[2:end],
-            omega_r_base[68:end]
-        )    
+            omega_r_base[1:(REFINE_LO - 1)],
+            omega_refined,
+            omega_r_base[(REFINE_HI + 1):end]
+        )
         global L = contour_L()
         load_on_workers()
         @everywhere begin
@@ -651,8 +692,34 @@ begin
     function complexvec_to_json(vec)
         return [Dict("re" => real(x), "im" => imag(x)) for x in vec]
     end
-    filename = "contour_iteration_v4.3.json"
+    filename = "contour_iteration_v4.4.json"
 end
+
+# ---------------------------------------------------------------------------
+# v4.4 omega-descent controls
+# ---------------------------------------------------------------------------
+const OMEGA_BISECT        = true    # false -> exactly the v4.3 omega update
+const OMEGA_GAP_TARGET    = 1e-8    # wanted omega_i - max(imag(omega_F))
+const OMEGA_BISECT_ENGAGE = 1e-3    # only bisect once the gap is below this
+const OMEGA_BISECT_MAX    = 25      # probes per iteration (each = 1 branch track)
+const OMEGA_BISECT_TOL    = 1e-12   # stop when the bracket is this narrow
+# COST.  A probe costs one contour_alpha_L_conti, the same call the v4.3 omega
+# step already made once or twice per iteration.  When the bound is admissible
+# the first probe takes it and the endgame costs ONE extra call per iteration.
+# Probes only pile up if there is a wall, and then every such iteration prints
+# a "bisect wall ..." line.  25 probes take 1e-3 -> 3e-11, i.e. well past
+# OMEGA_GAP_TARGET; if the log shows persistent walls and the run is crawling,
+# drop this to ~8 (still 1e-3 -> 4e-6, ~75x better than v4.3) rather than
+# raising it.
+# Optional extra guard: reject a trial height whose alpha branches come closer
+# to F than this.  0.0 = disabled, which is deliberate for the first v4.4 run:
+# we want the bisection to find the REAL wall (branch tracking / Phi_F near
+# field) rather than an imposed one.  The achieved F-branch distance is logged
+# and stored as "d_contour_at_L" every iteration, so if it collapses, set this.
+const OMEGA_BISECT_MIN_DFC = 0.0
+# OMEGA_BISECT_ENGAGE also caps how far L can fall in one iteration, so the
+# early large-scale descent -- where F still has to deform a lot -- runs
+# exactly as in v4.3 and only the endgame is aimed.
 
 # ---------------------------------------------------------------------------
 # RESUME = false  ->  original behaviour: `filename` is OVERWRITTEN with a
@@ -690,6 +757,18 @@ begin
             "alpha_L_l" => complexvec_to_json(alpha_L_l),
             "F" => complexvec_to_json(F),
             "omega_F" => complexvec_to_json(omega_F),
+            # same fields as the in-loop entries, so every entry has the same
+            # schema.  Before the loop L has not been placed against omega_F
+            # yet, so omega_F_at_L is just omega_F.
+            "omega_F_at_L" => complexvec_to_json(omega_F),
+            "omega_gap" => omega_i - maximum(imag.(omega_F)),
+            "omega_bisect_status" => "initial",
+            "omega_bisect_tries" => 0,
+            # null here: branch_distance / contour_distance are defined below
+            # this block, and the distances carry no meaning for the pre-loop
+            # state anyway.  Every in-loop entry has numbers.
+            "d_branch" => nothing,
+            "d_contour" => nothing,
         )
         current_array = Any[]
         push!(current_array, dict_to_JSON)
@@ -739,6 +818,26 @@ function branch_overlap_valid(alpha_u, alpha_l; overlap_tol = 1e-8)
         "no overlap: min upper/lower distance=%.3e",
         min_dist
     )
+end
+
+# ---------------------------------------------------------------------------
+# v4.4: is a trial height for L admissible?
+#
+# Builds the trial L, tracks both alpha branches along it and applies the same
+# acceptance test the v4.3 omega step used (finite branches, no upper/lower
+# overlap).  Returns the trial contours as well so a successful probe is not
+# recomputed.  This is the expensive call in the bisection -- one
+# contour_alpha_L_conti per probe -- which is why the bisection only engages
+# once the gap is already small (see OMEGA_BISECT_ENGAGE).
+# ---------------------------------------------------------------------------
+function omega_trial_ok(omega_i_trial)
+    L_try = contour_L_at(omega_i_trial)
+    au_try, al_try = contour_alpha_L_conti(L_try)
+    if !all(isfinite, au_try) || !all(isfinite, al_try)
+        return false, "non-finite branch", L_try, au_try, al_try
+    end
+    ok, reason = branch_overlap_valid(au_try, al_try)
+    return ok, reason, L_try, au_try, al_try
 end
 
 function local_contour_distances(F, alpha_L_u, alpha_L_l)
@@ -863,8 +962,17 @@ for k = 1:2000
         
         #print_block("OMEGA-CONTOUR UPDATE")
 
+        # omega_F as it stands NOW, i.e. the one L is about to be placed
+        # against.  Stored in the JSON as "omega_F_at_L"; the "omega_F" field
+        # is recomputed after the alpha update and is one step newer.
+        omega_F_at_L = copy(omega_F)
+
         omegaF_max_i = maximum(imag.(omega_F))
-        omega_clearance = 2e-7
+        # v4.4: 2e-7 -> 1e-9.  In v4.3 this was never the binding constraint
+        # (the candidate spacing at the bound was ~4.5e-4, 1500x larger), but
+        # with the bisection below it becomes the actual floor, so it has to
+        # sit under OMEGA_GAP_TARGET.
+        omega_clearance = 1e-9
         omega_lower_bound = omegaF_max_i + omega_clearance
 
 
@@ -894,15 +1002,28 @@ for k = 1:2000
         end
 
         omega_dt = delta_t
-        omega_dt_min = 1e-8
+        # v4.4: 1e-8 -> 1e-12.  Converging TO a 1e-8 gap needs steps smaller
+        # than 1e-8; with the old floors the run rejected them as "useless"
+        # and then gave up with "No safe omega step found".
+        omega_dt_min = 1e-12
 
         min_valid_omega_candidates = 2
         max_omega_jump_factor = 40.0
 
-        min_useful_omega_jump = 1e-8
+        min_useful_omega_jump = 1e-12
 
         if !omega_repaired
             for omega_attempt in 1:50
+                # NOTE (v4.4, unchanged on purpose): omega_i_vectorization is
+                # a constant vector and is never written inside this loop --
+                # only omega_i_cache is -- so the central difference
+                # omega_i_vectorization[j+1] - omega_i_vectorization[j-1] is
+                # identically zero and the d_d_omega_r_Phi_L coupling below
+                # contributes nothing.  Reconstructing the v4.3 steps with that
+                # term dropped reproduces the stored omega_i exactly.  Left in
+                # place so v4.4 differs from v4.3 only by the bisection; if L
+                # is ever meant to deform rather than translate, this is where
+                # it would have to be fixed.
                 omega_i_vectorization = fill(omega_i, length(omega_r))
                 omega_i_cache = copy(omega_i_vectorization)
 
@@ -1014,6 +1135,101 @@ for k = 1:2000
 
             @everywhere begin
                 normals_F = contour_normals(F)
+            end
+        end
+
+        # -------------------------------------------------------------------
+        # v4.4 BISECTION ENDGAME
+        #
+        # The candidate step above can only land on one of N_L pre-computed
+        # heights, and near the bound those sit ~4.5e-4 apart, so it parks a
+        # few 1e-4 above omega_F no matter how long it runs (v4.3: 963
+        # iterations, best gap 1.24e-5 at k=401, ending at 3.0e-4).
+        #
+        # Here we aim instead: take the LOWEST omega_i whose branch tracking
+        # still succeeds.  omega_lower_bound is the deepest legal height and
+        # the current omega_i is known good, so bisect between them.
+        #   - probe omega_lower_bound first: if it is admissible we are done in
+        #     one branch track, which is the steady-state cost once converged
+        #   - otherwise halve the bracket; ~17 probes take 1e-3 -> 1e-8
+        # A failed probe is not an error: it means the branch tracker cannot
+        # follow L that close to omega_F, and the bracket then reports where
+        # that wall is (omega_bisect_status = "wall").
+        # -------------------------------------------------------------------
+        omega_bisect_status = OMEGA_BISECT ? "idle" : "off"
+        omega_bisect_tries  = 0
+        omega_gap_before    = omega_i - omega_lower_bound
+        omega_gap_after     = omega_gap_before
+        omega_wall_reason   = ""
+
+        if OMEGA_BISECT && omega_accepted &&
+           omega_gap_before > OMEGA_GAP_TARGET &&
+           omega_gap_before < OMEGA_BISECT_ENGAGE
+
+            a_lo = omega_lower_bound     # deepest legal height, validity unknown
+            b_hi = omega_i               # current height, known admissible
+
+            best_w = omega_i
+            best_L = L
+            best_u = alpha_L_u
+            best_l = alpha_L_l
+
+            for probe in 1:OMEGA_BISECT_MAX
+                omega_bisect_tries += 1
+                # first probe goes all the way down; after that, bisect
+                w_try = (probe == 1) ? a_lo : 0.5 * (a_lo + b_hi)
+
+                ok, reason, L_try, au_try, al_try = omega_trial_ok(w_try)
+
+                if ok && OMEGA_BISECT_MIN_DFC > 0.0
+                    dfc_try = contour_distance(F, au_try, al_try)
+                    if !isfinite(dfc_try) || dfc_try < OMEGA_BISECT_MIN_DFC
+                        ok = false
+                        reason = @sprintf("F-branch distance %.3e < %.3e",
+                                          dfc_try, OMEGA_BISECT_MIN_DFC)
+                    end
+                end
+
+                if ok
+                    best_w, best_L, best_u, best_l = w_try, L_try, au_try, al_try
+                    b_hi = w_try
+                else
+                    a_lo = w_try
+                    omega_wall_reason = reason
+                end
+
+                if (best_w - omega_lower_bound) <= OMEGA_GAP_TARGET
+                    omega_bisect_status = "target"
+                    break
+                end
+                if (b_hi - a_lo) < OMEGA_BISECT_TOL
+                    omega_bisect_status = "wall"
+                    break
+                end
+                omega_bisect_status = "budget"
+            end
+
+            if best_w < omega_i
+                global omega_i   = best_w
+                global L         = best_L
+                global alpha_L_u = best_u
+                global alpha_L_l = best_l
+                load_on_workers()
+                omega_jump = abs(omega_i - omega_i_old)
+                omega_status = omega_status * "+bisect"
+            end
+
+            omega_gap_after = omega_i - omega_lower_bound
+
+            if omega_bisect_status != "target"
+                @printf(
+                    "[k=%d] bisect %s after %d probes: gap %.3e -> %.3e | dFC=%.3e | wall: %s\n",
+                    k, omega_bisect_status, omega_bisect_tries,
+                    omega_gap_before, omega_gap_after,
+                    contour_distance(F, alpha_L_u, alpha_L_l),
+                    isempty(omega_wall_reason) ? "-" : omega_wall_reason
+                )
+                flush(stdout)
             end
         end
                     #
@@ -1154,7 +1370,7 @@ for k = 1:2000
         load_on_workers()
         global omega_F = contour_omega_F(F)
         @printf(
-            "[%04d] jump=%9.3e | dUL=%9.3e | dUF=%9.3e | dLF=%9.3e | dt=%9.3e | ζ=%9.3e | %s/%s\n",
+            "[%04d] jump=%9.3e | dUL=%9.3e | dUF=%9.3e | dLF=%9.3e | dt=%9.3e | ζ=%9.3e | gap=%9.3e (%s,%d) | %s/%s\n",
             k,
             omega_jump,
             d_branch,
@@ -1162,6 +1378,9 @@ for k = 1:2000
             dist_l,
             local_delta_t,
             zeta_common,
+            omega_gap_after,
+            omega_bisect_status,
+            omega_bisect_tries,
             omega_status,
             alpha_status
         )
@@ -1174,6 +1393,17 @@ for k = 1:2000
             "alpha_L_l" => complexvec_to_json(alpha_L_l),
             "F" => complexvec_to_json(F),
             "omega_F" => complexvec_to_json(omega_F),
+            # v4.4: omega_F as it stood when L was placed.  "omega_F" above is
+            # recomputed after the alpha update, so (L, omega_F) is one step
+            # out of sync and the gap read from it is not the controlled one.
+            "omega_F_at_L" => complexvec_to_json(omega_F_at_L),
+            "omega_gap" => omega_gap_after,
+            "omega_bisect_status" => omega_bisect_status,
+            "omega_bisect_tries" => omega_bisect_tries,
+            # both measured with the post-bisection L and the pre-alpha-update
+            # F, i.e. the state at the moment L was placed
+            "d_branch" => d_branch,
+            "d_contour" => d_contour,
         )
         json_str = open(filename, "r") do file
             read(file, String)

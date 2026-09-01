@@ -2,13 +2,6 @@
 Find the Briggs pinch point from a Briggs contour-iteration history.
 
     python compute_pinch.py <big_history.json>
-
-The last frame of the history gives a starting guess.  Around that guess the
-script samples omega(alpha) on a circle, fits a polynomial, and solves
-d(omega)/d(alpha) = 0.  The circle is then re-centred on the result and
-halved, a few times over.
-
-Writes <history>_pinch_simple.json and three PNGs next to the input file.
 """
 
 import json
@@ -272,10 +265,6 @@ def write_output_json(output_path, source_path, last, seed,
 
 # ---------------------------------------------------------------------------
 # 5. PLOT: omega-plane and alpha-plane
-#
-# With show_omega_samples=True the omega-plane also shows the omega values
-# produced by every alpha sample point, and each circle in the alpha-plane
-# takes the colour of its omega samples.
 # ---------------------------------------------------------------------------
 def plot_pinch(output_path, last, seed, alpha_p, omega_p, level_results,
                show_omega_samples=False):
@@ -298,8 +287,7 @@ def plot_pinch(output_path, last, seed, alpha_p, omega_p, level_results,
     ax[0].plot(omega_F.real, omega_F.imag, "r", lw=1.6, label=r"$\omega_F$")
     ax[0].plot(omega_p.real, omega_p.imag, "*", ms=5, label=r"$\omega_p$")
 
-    # colour chosen for each circle; empty unless the omega samples are drawn,
-    # in which case the two panels are colour-matched level by level
+    # colour of each circle; empty unless the omega samples are drawn
     level_colours = {}
 
     if show_omega_samples:
@@ -402,15 +390,8 @@ def plot_alpha_spectrum(output_path, last, alpha_p, omega_p):
         return ((np.min(values.real) - r_pad, np.max(values.real) + r_pad),
                 (np.min(values.imag) - i_pad, np.max(values.imag) + i_pad))
 
-    # -------------------------------------------------
-    # 1. SPECTRUM window.
-    #
-    # The full spectrum has no natural outer edge: it runs out to
-    # |alpha| ~ 1e8, which is the unresolved tail of the N = NUM_MODES
-    # Chebyshev discretisation, not physics.  So the panel shows every
-    # eigenvalue with |alpha| <= SPECTRUM_MAX_ABS and reports how many
-    # were left out.
-    # -------------------------------------------------
+    # 1. SPECTRUM window: |alpha| <= SPECTRUM_MAX_ABS; the tail out to
+    #    |alpha| ~ 1e8 is the unresolved discretisation, not physics
     spec_kept = alpha_spec[np.abs(alpha_spec) <= SPECTRUM_MAX_ABS]
 
     print(
