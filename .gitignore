@@ -1,5 +1,32 @@
 .vscode/
-*.mp4
 
-# large generated result files (keep local, like *.mp4)
+# large generated run output (stays local)
 contour_iteration_*.json
+*.jsonl
+checkpoint_*.json
+
+# images (all figures and frames stay local)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.svg
+*.eps
+
+# videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.wmv
+*.m4v
+
+# python cache and scratch
+__pycache__/
+*.pyc
+_deltest2
