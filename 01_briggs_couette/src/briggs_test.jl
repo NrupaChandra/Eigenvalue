@@ -6,9 +6,10 @@ begin
     w = workers()
 end
 @everywhere begin
-    C1 = -1.0 + 0.96im
-    C2 = 0.4 + 0.8im
-    C3 = 1.0 + 0.0im
+   
+    C1 = 0.5 + 0.0im
+    C2 = 1.0 - 1.0im
+    C3 = -1.0 + 0.0im
 
     alpha_pinch_exact = -C2 / (2*C3)
     omega_pinch_exact = C1 - C2^2 / (4*C3)
@@ -16,6 +17,7 @@ end
     println("Exact pinch alpha = ", alpha_pinch_exact)
     println("Exact pinch omega = ", omega_pinch_exact)
 end
+
 
 @everywhere function algebraic_omega(alpha)
     return C1 + C2*alpha + C3*alpha^2
@@ -65,8 +67,8 @@ begin
     end
     # ALPHA contour: F starts on the real alpha line
     @everywhere begin
-        alpha_r_start = -1.0
-        alpha_r_end = 0.5
+        alpha_r_start = 0.0
+        alpha_r_end = 1.0
         N = 141
 
         alpha_r = range(alpha_r_start, alpha_r_end, length=N)
@@ -128,12 +130,12 @@ begin
     omega_F = contour_omega_F(F)
     # OMEGA contour: L
     @everywhere begin
-        omega_r_start = -1.2
-        omega_r_end = -0.5
+        omega_r_start = 0.0
+        omega_r_end = 1.0
         omega_r = range(omega_r_start, omega_r_end, length=N)
     end
 
-    omega_clearance_initial = 0.1
+    omega_clearance_initial = 0.4
     omega_i = maximum(imag.(omega_F)) + omega_clearance_initial
     @everywhere omega_i = $omega_i
     function contour_L()
@@ -538,7 +540,12 @@ begin
     function complexvec_to_json(vec)
         return [Dict("re" => real(x), "im" => imag(x)) for x in vec]
     end
-    filename = "contour_iteration_algebraic_testv6.json"
+
+    output_dir = raw"C:\git\Eigenvalue\01_briggs_couette\results\json"
+
+    mkpath(output_dir)
+
+    filename = joinpath( output_dir, "contour_iteration_algebraic_testv6.1.json")
 end
 
 begin
@@ -797,7 +804,7 @@ end
 
 blocked_count = 0
 
-for k = 1:1500
+for k = 1:350
     #print_iteration_header(k)
     global omega_i, L, alpha_L_u, alpha_L_l, alpha_i, F, omega_F, iteration_step
     local dict_to_JSON, current_array

@@ -1,0 +1,3769 @@
+# Kilian Vinzenz Wilhelm
+
+# ---------------------------------------------------------------------------
+# v8 (2026-10-16)  --  v7.2 rev B + POINT-CLOUD SPATIAL BRANCHES.
+#
+#   The ONLY algorithmic change is how the spatial eigenvalues on L are
+#   collected, selected and represented.  v7.2 took a seed at
+#   omega_r_base[25] and walked along L, taking at each omega the eigenvalue
+#   nearest the previous one on the requested side (select_tracked with the
+#   CHANGE 9 guard).  v8 uses the method of piont_cloudtest/pointcloud_test.jl
+#   (session notes 2026-10-13):
+#
+#     1. one pmap over L: full spatial spectrum per omega (same solver, same
+#        equilibration), non-finite eigenvalues dropped;
+#     2. upper/lower by the unchanged nearest-node normal test; each
+#        eigenvalue also gets d = distance to the F POLYLINE and s =
+#        arclength of its foot point on F (arclength, foot_on_F);
+#     3. all omegas pooled into cloud_u / cloud_l, filtered by CLOUD_ABS_MAX,
+#        CLOUD_DIST_MAX and the s-range (gather_cloud);
+#     4. alpha_L_u / alpha_L_l = binned lower envelope of d over s with the
+#        two-sided spike filter (cloud_frontier).  No seed, no walk.
+#   The test script's extra filter abs(real(e)) > 1e-2 is NOT copied.
+#
+#   CONSEQUENCE: alpha_L_u[j] no longer belongs to L[j], and the two
+#   frontiers have their own lengths.  How each consumer was handled:
+#     * Phi_F and its gradients, influence_ratio, acceptance_factor,
+#       contour_distance, dist_u/l, branch_overlap_valid, side_check:
+#       they only need a polyline / point set -- unchanged.
+#     * Everything that needs the gap as a function of omega_r (d_vec,
+#       i_pinch, d_branch, h_local, pinch_fit, omega2_estimate, the stall
+#       history, the L refinement, throat_r for regrid_F!) uses PER-OMEGA
+#       PAIRS pair_u[j], pair_l[j]: at L[j], the eigenvalue nearest F on
+#       each side among that omega's filtered cloud points (fallback:
+#       nearest on that side unfiltered, counted in pair_fallback).  This is
+#       v7.2's contour_alpha_L_init rule (dominant_from) with the polyline
+#       distance: independent per omega, nothing tracked.  Near the pinch it
+#       is the pinching pair, so d_branch keeps the meaning that the zeta
+#       law, PINCH_TOL and the adaptive-L calibration were built on.
+#     * branch_distance is now a SET distance (min over all pairs).  Logged
+#       for the frontiers as d_branch_front.  Near a square-root pinch the
+#       closest approach of the two image curves is at the same omega, so it
+#       should agree with d_branch up to the frontier's bin resolution.
+#     * side_report prints the omega of the offending frontier point from
+#       its source index (front_j_u / front_j_l).
+#     * contour_alpha_L_conti returns a NamedTuple; set_branches! installs
+#       it, so frontiers, pairs, tags, clouds and track_jump_u/l always
+#       belong to the ACCEPTED geometry.  (In v7.2 the track_* globals were
+#       overwritten by every rejected omega trial / bisection probe.)
+#       track_overrides is always 0, kept so the log keys do not change.
+#   Seed-and-walk is kept as contour_alpha_L_walk; verify_fast_path() now
+#   checks the walk against the v4.4 reference path, as before.
+#   Files: contour_iteration_v8.jsonl, checkpoint_v8.json.  The checkpoint
+#   also stores pair_u/l and the frontier tags; the log gains pair_u/l,
+#   d_branch_front, cloud_n_u/l, front_n_u/l, pair_fallback.
+#
+#   REV A (2026-10-16, after the first run stopped at k = 6):
+#     The k = 6 stop is the SAME event as the first v7.2 run's k = 6 stop
+#     (see briggs-v7.2-stop-at-k6-and-v7.3.md).  The bisection put L at the
+#     3-node parabolic peak of Im omega_F + 1e-9 = -0.034842763957, but the
+#     true max of Im omega along the polyline F is -0.034842118899 (at
+#     alpha_r = 0.1126, between nodes 11 and 12), 6.45e-7 HIGHER.  L below
+#     the image of F forces a root across F: alpha = 0.111581 - 0.031951i
+#     (omega_r = 0.0556) sat 7.04e-7 BELOW F (= logged side_om_gap_l).
+#     v7.2 rev B survived it because the walk kept calling that root
+#     "upper" and the next F step cleared it.  A point cloud has no labels:
+#     the root went into the LOWER cloud, became pair_l[11] (fake d_branch
+#     0.062), the F step moved F 0.025 down past it, and side_check stopped
+#     the run.  Without labels, L must stay strictly ABOVE the image of F.
+#     A1  omegaF_peak_refined: the v7.3 fix, re-implemented here (no v7.3
+#         file exists on disk).  Around every node local max within
+#         OMEGA_LB_BAND of the node max, Im omega is sampled at
+#         OMEGA_LB_M sub-points per F segment on the two adjacent segments
+#         (2*OMEGA_LB_M + 1 temporal solves) and a 3-point parabola (in
+#         arclength) is fitted through the best sample.  Never below the
+#         v7.2 bound.  On the k = 6 frame: -0.034842118988, i.e. 9e-11 from
+#         a 41-sample dense max (clearance is 1e-9), and the critical root
+#         is then 6.4e-7 ABOVE F.  OMEGA_LB_REFINE = false -> v7.2 bound.
+#     A2  CLOUD_SIDE_TEST = :graph.  Upper/lower is decided by the sign of
+#         Im(e) - F_interp(Re e), the same exact polyline test side_check
+#         uses (F is a graph: alpha_r strictly increasing).  The node-normal
+#         test of pointcloud_test.jl is off by ~h^2 kappa / 4: on the k = 6
+#         frame it gave -2.8e-8 for a root whose true gap is -7.04e-7.  The
+#         bisection drives the nearest root to within ~1e-9..1e-5 of F
+#         every frame, i.e. inside that error.  Points with Re(e) outside
+#         F's alpha_r range keep the node-normal test.  :node -> as before.
+#     Logged: omega_lb_refined, omega_lb_node, omega_lb_alpha_r.
+#
+#   REV B (2026-10-16, after the rev-A run stopped at k = 8):
+#     "frontier too short (upper 78, lower 1 points)" in the omega trial of
+#     k = 8; the lower frontier had already fallen 71 -> 20 at k = 7.  The
+#     lower branch is ~3.2 BELOW F.  For a point that far away the foot on
+#     the polyline is ill-conditioned: its nearest node is not the one above
+#     it but wherever F reaches down furthest (|e - F_k|^2 gains ~2 * 3.2 *
+#     dy for a node dy lower, and loses only dx^2), so as soon as the F step
+#     makes a dip, every lower point gets the SAME foot s, all fall into one
+#     bin and one frontier point survives.  Reproduced on the old frame-6 F:
+#     arclength bins give 34 lower frontier points (feet squeezed into
+#     s in [0, 0.030]); add a dip of 0.05 at alpha_r = 0.3 and all 100 feet
+#     sit at s = 0.2567 -> 1 point.  With Re(alpha) as the bin coordinate
+#     the same cloud gives 78 points in every case.
+#     B1  CLOUD_COORD = :alpha_r.  Frontier bins, the range filter and the
+#         ordering use Re(alpha) (F is a graph over alpha_r, as A2 already
+#         assumes).  d is still the distance to the F polyline.
+#         CLOUD_S_PAD is then a fraction of F's alpha_r width.
+#         :arclength -> the foot arclength s of pointcloud_test.jl.
+#
+#   KNOWN RISKS, NOT CHANGED HERE:
+#     * Without labels an omega trial that DOES put a root across F cannot
+#       be recognised as such; the root is silently re-classified.  Rev A
+#       removes the known cause (peak underestimate).  A crossing caused
+#       by the F STEP is still caught by the "alpha" side_check.
+#     * CLOUD_NBINS = 0 -> length(L) bins, UNIFORM in s over len(F) ~ 1.
+#       The adaptive L clusters omegas around the pinch, but those samples
+#       fall into a handful of bins, so the frontier resolves the throat at
+#       ~len(F)/N_L, not at the omega spacing.  Compare d_branch_front with
+#       d_branch and watch front_n_u/l once d_branch < ~1e-2.
+#     * The frontier stops at F's alpha_r window (CLOUD_S_PAD = 0), so
+#       branch parts beyond F's ends no longer enter Phi_F.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# v7.2 REVISION B (2026-10-14)  --  graded F from v6.1, ported into v7.2.
+#
+#   The first v7.2 run stopped at k = 6.  The omega-stage side check caught
+#   a transient: the bisection put L at the 3-node parabolic peak + 1e-9,
+#   but between nodes the true max of Im(omega) along F was 4.5e-7 higher,
+#   so the upper branch dipped under F.  The same transient is in every
+#   earlier log at iteration 5-6 (v4.9, v6, v6.1, v7.1, rescanned), and in
+#   each one the next F step cleared it.  The crossings that matter come
+#   later, once d is only about 2 F cells (v7.1: d = 0.021, k = 276).
+#   v6.1 is the one run where they stopped: once its regrid worked (spacing
+#   at the throat <= 0.25 d) there were no crossings from k = 334 to 1071.
+#   v6 had the same code with the regrid blocked by a bug and was crossed
+#   on 83 % of frames.
+#
+#   STEP 0  The omega-stage side check is REPORT-ONLY (logged as side_om_*).
+#           Only a crossing that is still there after the F step stops the
+#           run, after SIDE_STOP_RUN consecutive iterations (1 = at once).
+#   STEP 1  The F step works on a non-uniform alpha_r grid:
+#           * alpha_i_r, alpha_i_rr use unequal-spacing stencils (v5
+#             CHANGE 13).  Where the two neighbouring cells are equal to
+#             F_UNIFORM_RTOL the OLD expressions are evaluated, so on the
+#             initial uniform grid the step is bit-for-bit unchanged.
+#           * sigma * alpha_i_rr is explicit.  It is stable only for
+#             sigma dt <= ~0.5 h+ h-, which a fine F block breaks near
+#             d ~ 3e-4.  sigma is capped per node at SIGMA_CFL h+ h- / dt;
+#             on the uniform grid the cap is ~1000x above sigma, i.e. it
+#             never acts (n_sigma_cap logs how often it does).
+#           * omegaF_peak_imag fits its 3-point parabola in alpha_r on a
+#             non-uniform triple (old index form on a uniform one).
+#           * Phi_L and its gradients use omega_F[end], not omega_F[N].
+#   STEP 2  regrid_F!: v6.1's rule, with v6.3's trigger = guard fix.  When
+#           F_H_FRAC * d < REGRID_GAIN * (F spacing at the throat) for
+#           F_HOLD consecutive iterations, nodes are ADDED around the
+#           throat (midpoint of the tracked pair at argmin |a_u - a_l|):
+#           F_FINE nodes either side at h0 = F_H_FRAC * d, then grown by
+#           F_RATIO until they reach the existing spacing.
+#           Difference from v6.1: v6.1 rebuilt the whole grid and
+#           interpolated, which coarsens the far field on a [0,1] window.
+#           Here every existing node is KEPT and new nodes are placed ON the
+#           current polyline, so a regrid never moves F -- it only adds
+#           nodes.  The window stays [0,1].  Normals and omega_F are
+#           recomputed immediately.  F_REGRID = false -> no regrid.
+#   Checkpoint now stores alpha_r (it was implicit before).
+#
+#   NOT ported: v5's crossing veto (v5 was still crossed on 43 % of frames),
+#   the descent term, the smoothing changes, num_modes = 80, window
+#   extension, peak refinement (v6.1 needed none once F was graded).
+#   rolling_average_filter(., 7) is still in INDEX units.  Inside the fine
+#   block the spacing is uniform, so it averages over 15 h0 = 3.75 d there.
+#   If F ripples after a regrid, look here first.
+#
+#   REGRESSION TEST: until the first side hit (k = 6) and the first regrid,
+#   nothing changes, so frames 1-5 must match the first v7.2 run
+#   (contour_iteration_v7.2.jsonl.bak1 after archiving) to the last digit.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# v7.2  --  v7.1 + STOP WHEN A BRANCH TOUCHES F.  Numerics otherwise unchanged.
+#
+#   In v7.1 the upper branch crossed F from iteration ~276 on and nothing
+#   noticed: the only guard was omega_i >= peak(Im omega_F) + 1e-9, with the
+#   peak estimated from the 100 F nodes, and the side classification in
+#   spatial_payload can be overridden by the CHANGE 9 continuity guard.
+#
+#   v7.2 tests the tracked branches directly against F.  F is a graph
+#   alpha_i(alpha_r), so the side of a point e is the sign of
+#       Im(e) - F_interp(Re(e))        (F linearly interpolated, not nodes)
+#   Every upper-branch point must be ABOVE F, every lower-branch point BELOW,
+#   by more than SIDE_TOL.  Points with Re(e) outside F's alpha_r range have
+#   no side and are skipped (counted in side_out).  Checked twice per
+#   iteration:
+#     "omega"  after the omega step (+ bisection), against the F L was placed
+#              against.  On a hit the alpha update is skipped, so the logged
+#              F is the one that was crossed.
+#     "alpha"  after the alpha update, new F against the current branches.
+#   On a hit the frame is logged, the checkpoint written, and the run stops
+#   (same path as PINCH_TOL).  SIDE_STOP = false -> v7.1 behaviour, but the
+#   side_* diagnostics are still logged.
+#   Files: contour_iteration_v7.2.jsonl, checkpoint_v7.2.json.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# v7.1  --  v7 numerics UNCHANGED; only the log changes.
+#
+#   1. EVERY ITERATION IS LOGGED (LOG_EVERY = 1).  v7 kept every 10th frame
+#      because its log was one JSON array read-parsed-rewritten per save
+#      (O(k^2) I/O).
+#   2. THE LOG IS JSONL (one entry per line, APPENDED), as in v6.x.  A save
+#      costs one line regardless of k, so LOG_EVERY = 1 is cheap.  A crash
+#      mid-append leaves at most one partial final line; read_log() skips it
+#      and truncate_log_to!() removes it on resume, so a later append can
+#      never be glued onto a broken line.
+#   3. The final frame is always logged when the run stops on PINCH_TOL
+#      (stop_after_save).  In v7 it was dropped unless its number happened to
+#      be a multiple of LOG_EVERY.
+#   Files: contour_iteration_v7.1.jsonl, checkpoint_v7.1.json -- a v7.1 run
+#   never touches the v7 files.  plot_frame.py and
+#   plot_contour_deformation_new.m already read .jsonl.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# v4.5  --  (A) make one iteration cheap, (B) put the L points where they help.
+#
+# WHAT v4.4 ESTABLISHED (measured on contour_iteration_v4.4.json, 567 entries)
+#   The bisection endgame works: omega_gap sits at the 1e-9 clearance from
+#   iteration ~275 on, and omega_i ends at -0.572830165888 against
+#   Im(omega_p) = -0.572829694809, i.e. 4.7e-7 past the true pinch height.
+#   The residual branch gap is then PURELY the L discretisation:
+#
+#       d = 2 |sqrt( 2 (L[i] - omega_p) / omega'' )|      (matches to 0.1-0.3 %)
+#
+#   with Re(omega_p) = 0.2986491 sitting 49.4 % into the cell
+#   [0.2985982, 0.2987013] of width 1.031e-4.  Half-cell miss 5.089e-5 gives
+#   d = 3.079e-2; observed 3.083e-2.  Same check on v4.3 (h = 2.538e-4):
+#   predicted 4.86e-2, observed best 4.73e-2.  Both runs plateaued at exactly
+#   the half-cell value, so d_min has been a grid diagnostic, not a physical
+#   one, since iteration ~275.  Those last ~290 iterations produced nothing.
+#
+# CHANGES
+#   1. eigvals INSTEAD OF eigen.  No eigenvector is used anywhere in the loop:
+#      dominant_eigvals returned them and every caller discarded them
+#      (`_, _`), couetteflow_temporal_sing_mode likewise.  Val(:eigvals) skips
+#      the Schur-vector back-substitution in ggev.
+#   2. ONE EIGENSOLVE PER omega, NOT TWO.  v4.4 swept the upper branch and the
+#      lower branch separately, so every omega on L was factorised twice for
+#      the same spectrum.  Both branches are now selected from one spectrum.
+#   3. PARALLEL SPECTRA, SERIAL SELECTION.  The spectrum at omega does not
+#      depend on alpha_prev -- only the final argmin does.  So all N_L
+#      eigenproblems are solved by one balanced pmap and the tracking sweep
+#      afterwards is pure arithmetic on the main process.  v4.4 ran a
+#      460-long SERIAL chain (pmap over a ONE-element array) on 2 of 5
+#      workers.  Results are unchanged by construction; verify_fast_path()
+#      checks that against the v4.4 code path, which is kept below as
+#      contour_alpha_L_conti_ref.
+#   4. ADAPTIVE L.  The base 100-point grid is kept and a small window around
+#      the current argmin is subdivided by ADAPT_FACTOR whenever the run
+#      stalls (same winning omega_r and d_min flat to ADAPT_STALL_TOL over
+#      ADAPT_STALL_WINDOW iterations).  
+
+#   5. PINCH_TOL 1e-4 -> 3e-3.  The sqrt-law residual on the v4.4 run is white
+#      noise (lag-1 autocorrelation -0.02, uncorrelated between neighbouring
+#      grid points) of size delta_d = K/d with K = 2.56e-6, so signal equals
+#      noise at d = sqrt(K) = 1.6e-3.  1e-4 is below the double-precision
+#      floor of this 300x300 pencil and could never fire.
+
+# ---------------------------------------------------------------------------
+
+begin
+    using Distributed, Plots, BenchmarkTools, FFTW, JSON, Statistics, Printf
+    addprocs(5)
+    w = workers()
+end
+begin
+    @everywhere using LinearAlgebra, Statistics
+    ###############
+    # EIGENVALUES #
+    ###############
+    @everywhere begin
+        Re = 2000.0
+        beta = 0.0 + 0.0 * im
+        num_modes = 150
+        start = 0
+        terminate = 1
+        v_g = 0.0 + 0.0 * im
+    end
+    @everywhere begin
+        y_colloc_points = [cos((j - 1) * pi / (num_modes - 1)) for j = 1:num_modes]
+        y_colloc_points_new = ((start + terminate) / 2) .- y_colloc_points * ((terminate - start) / 2)
+        D0_static = zeros(Float64, num_modes, num_modes)
+        for j = 1:num_modes
+            D0_static[:, j] .= cos.((j - 1) * acos.(y_colloc_points))
+        end
+        D1_static = [zeros(num_modes, 1)    D0_static[:, 1]         4 * D0_static[:, 2]]
+        D2_static = [zeros(num_modes, 1)    zeros(num_modes, 1)     4 * D0_static[:, 1]]
+        D3_static = [zeros(num_modes, 1)    zeros(num_modes, 1)     zeros(num_modes, 1)]
+        D4_static = [zeros(num_modes, 1)    zeros(num_modes, 1)     zeros(num_modes, 1)]
+        D1_static_V2 = zeros(Float64, num_modes, num_modes)
+        D2_static_V2 = zeros(Float64, num_modes, num_modes)
+        D3_static_V2 = zeros(Float64, num_modes, num_modes)
+        D4_static_V2 = zeros(Float64, num_modes, num_modes)
+        D0_static_V2 = D0_static
+        D1_static_V2[:, 1:3] .= D1_static
+        D2_static_V2[:, 1:3] .= D2_static
+        D3_static_V2[:, 1:3] .= D3_static
+        D4_static_V2[:, 1:3] .= D4_static
+        for j = 4:num_modes
+            D1_static_V2[:, j] .= 2 * (j - 1) * D0_static_V2[:, j - 1] + (j - 1) * D1_static_V2[:, j - 2] / (j - 3)
+            D2_static_V2[:, j] .= 2 * (j - 1) * D1_static_V2[:, j - 1] + (j - 1) * D2_static_V2[:, j - 2] / (j - 3)
+            D3_static_V2[:, j] .= 2 * (j - 1) * D2_static_V2[:, j - 1] + (j - 1) * D3_static_V2[:, j - 2] / (j - 3)
+            D4_static_V2[:, j] .= 2 * (j - 1) * D3_static_V2[:, j - 1] + (j - 1) * D4_static_V2[:, j - 2] / (j - 3)
+        end
+        D1_static_V3 = D1_static_V2 / (-(terminate - start) / 2)^1
+        D2_static_V3 = D2_static_V2 / (-(terminate - start) / 2)^2
+        D3_static_V3 = D3_static_V2 / (-(terminate - start) / 2)^3
+        D4_static_V3 = D4_static_V2 / (-(terminate - start) / 2)^4
+        D0 = D0_static
+        D1 = D1_static_V3
+        D2 = D2_static_V3
+        D3 = D3_static_V3
+        D4 = D4_static_V3
+        u = y_colloc_points_new
+        d2u = 0.0
+    end
+    # -----------------------------------------------------------------------
+    # v4.5 CHANGE 1: mode2 === Val(:eigvals) returns the spectrum only.
+    # A, B are built exactly as before; only the LAPACK call differs
+    # (ggev with jobvl = jobvr = 'N').  Val(:eigen) is untouched so the
+    # reference path below still runs.
+    # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # v7 THE ONE CHANGE.  Diagonal equilibration of both pencils.
+    #
+    # R*P*S has the same eigenvalues as P for diagonal R, S, so this changes
+    # nothing about what is being computed -- only the conditioning of the
+    # LAPACK solve.  Both pencils here are badly scaled: A of the temporal
+    # problem carries D4/Re at ~1e14 against B11 at ~1e9, and max|T_n''''| ~ n^8,
+    # so the imbalance GROWS with num_modes.  Measured independently in numpy
+    # against the 20-digit analytic pinch:
+    #
+    #   temporal, num_modes = 150 : error 6.67e-9 -> 1.92e-14, cond(A) 9.7e10 -> 1.9e3
+    #   spatial                   : the returned branch separation never falls
+    #                               below ~3e-3 as built, however close omega is
+    #                               to omega_p; equilibrated it tracks the
+    #                               square-root law to ratio 1.001 at d = 1e-5.
+    #
+    # v4.7 stopped at reported d = 3.21e-3 -- ON that floor -- while its true
+    # |omega_i - Im omega_p| was 3.75e-7 and still falling 8.6x per 100 frames.
+    # It could not see its own progress.  This is what that costs to fix.
+    # -----------------------------------------------------------------------
+    @everywhere function equilibrate(mats...; iters::Int = 12)
+        n = size(mats[1], 1)
+        W = zeros(Float64, n, n)
+        for M in mats
+            W .+= abs.(M)
+        end
+        R = ones(Float64, n)
+        S = ones(Float64, n)
+        for _ in 1:iters
+            r = sqrt.(max.(vec(maximum(W; dims = 2)), 1e-300))
+            R ./= r
+            W ./= r
+            c = sqrt.(max.(vec(maximum(W; dims = 1)), 1e-300))
+            S ./= c
+            W ./= transpose(c)
+        end
+        return R, S
+    end
+
+    @everywhere function couetteflow(alpha, omega, mode::Val, mode2::Val)
+        setprecision(53) do
+            if mode === Val(:omega_collocation)
+                A11 = - im * alpha * (u * ones(Complex{Float64}, 1, length(u))) .* D2 + im * alpha * (u * ones(Complex{Float64}, 1, length(u))) * (alpha^2 + beta^2) .* D0 + im * alpha * (d2u * ones(1, length(u))) .* D0 + 1 / Re .* D4 - 2 / Re * (alpha^2 + beta^2) .* D2 + 1 / Re * (alpha^2 + beta^2)^2 .* D0 + alpha * v_g .* D0
+                A11 = [-200 * im * [D0[1:1, :]; D1[1:1, :]];   A11[3:num_modes - 2, :];    -200 * im * [D1[num_modes:num_modes, :]; D0[num_modes:num_modes, :]]]
+                A = A11
+                B11 = - im .* D2 + im * (alpha^2 + beta^2) .* D0
+                B11 = [[D0[1:1, :]; D1[1:1, :]];   B11[3:num_modes - 2, :];    [D1[num_modes:num_modes, :]; D0[num_modes:num_modes, :]]]
+                B = B11
+                # v7: equilibrate the (A, B) pair.  Same roots, cond(A) 9.7e10 -> 1.9e3.
+                Rq, Sq = equilibrate(A, B)
+                A = Rq .* A .* transpose(Sq)
+                B = Rq .* B .* transpose(Sq)
+            elseif mode === Val(:alpha_collocation)
+                A11 = -2 * im * omega * D1 - 4 / Re * D3 + 4 / Re * beta^2 * D1 - im * (u * ones(Complex{Float64}, 1, length(u))) .* D2 + im * beta^2 * (u * ones(1, length(u))) .* D0 + im * (d2u * ones(1, length(u))) .* D0 - im * v_g .* D2 + im * v_g * beta^2 .* D0
+                A12 = im * omega * D2 - im * omega * beta^2 * D0 + 1 / Re * D4 - 2 / Re * beta^2 * D2 + 1 / Re * beta^4 * D0
+                A11 .= [zeros(Complex{Float64}, 2, num_modes);                    A11[3:num_modes - 2, :];    zeros(Complex{Float64}, 2, num_modes)]
+                A12 .= [-200 * im * [D0[1:1, :]; D1[1:1, :]];   A12[3:num_modes - 2, :];    -200 * im * [D1[num_modes:num_modes, :]; D0[num_modes:num_modes, :]]]
+                B11 = - 4 / Re * D2 - 2 * im * (u * ones(Complex{Float64}, 1, length(u))) .* D1 + 2 * im * v_g .* D1
+                B11 = [zeros(Complex{Float64}, 2, num_modes);  B11[3:num_modes - 2,:];    zeros(Complex{Float64}, 2, num_modes);]
+                # v7: equilibrate the three n-by-n BLOCKS, then linearise.  Doing
+                # it after the companion is built is too late -- the companion
+                # ties the two block rows together and LAPACK's own balancing
+                # cannot undo it.  The quadratic is
+                #     alpha^2 B11 - alpha A11 - A12 = 0,
+                # and R(alpha^2 B11 - alpha A11 - A12)S has identical roots.
+                Rq, Sq = equilibrate(B11, A11, A12)
+                A11 = Rq .* A11 .* transpose(Sq)
+                A12 = Rq .* A12 .* transpose(Sq)
+                B11 = Rq .* B11 .* transpose(Sq)
+                A21 = 1 * Matrix{Complex{Float64}}(I, num_modes, num_modes)
+                A22 = zeros(Complex{Float64}, num_modes, num_modes)
+                A = [A11 A12; A21 A22]
+                B12 = zeros(Complex{Float64}, num_modes, num_modes)
+                B21 = zeros(Complex{Float64}, num_modes, num_modes)
+                B22 = 1 * Matrix{Complex{Float64}}(I, num_modes, num_modes)
+                B = [B11 B12; B21 B22]
+            end
+            if mode2 === Val(:matrix)
+                return A, B
+            elseif mode2 === Val(:eigen)
+                eigvals_, eigvecs_ = eigen(A, B)
+                return eigvals_, eigvecs_
+            elseif mode2 === Val(:eigvals)
+                return eigvals(A, B)
+            end
+        end
+    end
+end
+############
+# CONTOURS #
+############
+begin
+    global L = ComplexF64[]
+    global F = ComplexF64[]
+    global omega_F = ComplexF64[]
+    global alpha_L_u = ComplexF64[]
+    global alpha_L_l = ComplexF64[]
+
+    function load_on_workers()
+        @sync begin
+            for (name, data) in [(:L, L), (:F, F), (:omega_F, omega_F), (:alpha_L_u, alpha_L_u), (:alpha_L_l, alpha_L_l)]
+                for pid in workers()
+                    @async remotecall_wait(Core.eval, pid, Main, :($name = $(deepcopy(data))))
+                end
+            end
+        end
+    end
+
+    # v4.5: omega_r is now mutated at run time by the adaptive refinement, so
+    # the workers' stale copy from the @everywhere block below has to be
+    # replaced whenever it changes.  Nothing on a worker currently reads
+    # omega_r (L is always passed as an argument), but keeping the copies
+    # consistent costs nothing and removes a trap.
+    function push_omega_r()
+        @sync for pid in workers()
+            @async remotecall_wait(Core.eval, pid, Main, :(omega_r = $(deepcopy(omega_r))))
+        end
+    end
+
+    # ALPHA contour: F
+    @everywhere begin
+        alpha_r_start = 0.0
+        alpha_r_end = 1.0
+        N = 100
+        alpha_r = range(alpha_r_start, alpha_r_end, length=N)
+        alpha_i = fill(0.0, N)
+    end
+    function contour_F()
+        F = [alpha_r[j] + alpha_i[j] * im for j in eachindex(alpha_r)]   # rev B: was 1:N
+        return F
+    end
+    @everywhere F = Vector{Complex{Float64}}[]
+    F = contour_F()
+
+    # -----------------------------------------------------------------------
+    # v4.5 CHANGE 1: no eigenvector.  The caller only ever took the first
+    # return value.
+    # -----------------------------------------------------------------------
+    @everywhere function couetteflow_temporal_sing_mode(alpha)
+        ev = couetteflow(alpha, nothing, Val(:omega_collocation), Val(:eigvals))
+        ev = ev[[isfinite(real(e)) && isfinite(imag(e)) for e in ev]]
+        return ev[argmax(imag.(ev))]
+    end
+
+    # -----------------------------------------------------------------------
+    # v4.4 REFERENCE PATH.  Unused by the loop, kept so verify_fast_path()
+    # can check the new selection against it.  Do not delete.
+    # -----------------------------------------------------------------------
+    @everywhere function couetteflow_spatial_sing_mode_comparison(
+        omega, alpha_approximation, branch_side::Symbol, F, normals_F; side_tol = 0.0)
+        eigvals_, _ = couetteflow(nothing, omega, Val(:alpha_collocation), Val(:eigen))
+        mask = [isfinite(real(e)) && isfinite(imag(e)) for e in eigvals_]
+        eigvals_ = eigvals_[mask]
+        candidates = ComplexF64[]
+        for eigval in eigvals_
+            distances = [abs(eigval - f) for f in F]
+            idx_min = argmin(distances)
+            f_near = F[idx_min]
+            normal = normals_F[idx_min]
+            proj = real(conj(normal) * (eigval - f_near))
+            if branch_side == :upper && proj > side_tol
+                push!(candidates, eigval)
+            elseif branch_side == :lower && proj < -side_tol
+                push!(candidates, eigval)
+            end
+        end
+        if isempty(candidates)
+            diffs = abs.(ComplexF64(alpha_approximation) .- ComplexF64.(eigvals_))
+            return eigvals_[argmin(diffs)]
+        end
+        diffs = abs.(ComplexF64(alpha_approximation) .- candidates)
+        return candidates[argmin(diffs)]
+    end
+
+    function contour_omega_F(F)
+        @everywhere omega_F = Complex{Float64}[]
+        omega_F = pmap(alpha -> couetteflow_temporal_sing_mode(alpha), F)
+        return ComplexF64.(omega_F)
+    end
+    omega_F = contour_omega_F(F)
+
+    # OMEGA contour: L
+    @everywhere begin
+        omega_r_start = 0.0
+        omega_r_end = 0.5
+        omega_i = 0.0
+
+        # v4.5: this is the ONLY grid built up front.  v4.4's REFINE_LO /
+        # REFINE_HI / PTS_PER_CELL are gone -- the refinement below is placed
+        # by the run, not guessed before it.
+        omega_r_base = collect(range(omega_r_start, omega_r_end, length=100))
+        omega_r = copy(omega_r_base)
+        N_L = length(omega_r)
+    end
+    function contour_L()
+        L = Complex{Float64}[
+            omega_r[j] + omega_i * im
+            for j in eachindex(omega_r)
+        ]
+        return L
+    end
+    @everywhere L = Vector{Complex{Float64}}[]
+    L = contour_L()
+    #
+    @everywhere begin
+        alpha_L_u = Vector{Complex{Float64}}[]
+        alpha_L_l = Vector{Complex{Float64}}[]
+    end
+    #
+    load_on_workers()
+    @everywhere function contour_normals(F)
+        normals = Complex{Float64}[]
+        for j in 2:(length(F) - 1)
+            tangent = F[j+1] - F[j-1]
+            normal = im * tangent / abs(tangent)
+            push!(normals, normal)
+        end
+        insert!(normals, 1, normals[1])
+        push!(normals, normals[end])
+        return normals
+    end
+    function plot_normals()
+        x = real.(F)
+        y = imag.(F)
+        u_vec = real(contour_normals(F))
+        v_vec = imag(contour_normals(F))
+        quiver(x, y, quiver=(u_vec, v_vec), aspect_ratio=1; xlims=(-1.0, 1.0), ylims=(-1.0, 1.0))
+    end
+    @everywhere begin
+        normals_F = contour_normals(F)
+    end
+
+    # -----------------------------------------------------------------------
+    # v4.5 CHANGES 2 + 3.
+    #
+    # spatial_payload does the expensive part for ONE omega: one eigensolve,
+    # then the side classification, which depends only on (omega, F).  It
+    # returns both sides at once, so the upper and lower branches share a
+    # single factorisation instead of forcing two.
+    #
+    # Everything that depends on alpha_prev -- i.e. the tracking -- is a
+    # nearest-neighbour argmin over at most a few hundred numbers, so it is
+    # done afterwards on the main process.  This is what breaks v4.4's serial
+    # chain without changing any result: the spectrum at omega_j is the same
+    # number whether it was computed first, last, or in parallel.
+    #
+    # Payload fields
+    #   all   every finite eigenvalue at this omega        (fallback pool)
+    #   up    those on the +normal side of F,  up_d their distance to F,
+    #         up_s the arclength along F of their foot point
+    #   lo    those on the -normal side of F,  lo_d / lo_s likewise
+    #
+    # v8 point-cloud version (from pointcloud_test.jl): the side test is
+    # unchanged (sign of the projection onto the nearest node's normal).
+    # up_d / lo_d are now the distance to the F *polyline* rather than to the
+    # nearest node, and up_s / lo_s give the position along F, which is the
+    # coordinate the cloud frontier is built over (see cloud_frontier).
+    # Only non-finite eigenvalues are removed here; the test script's extra
+    # abs(real(e)) > 1e-2 filter is deliberately NOT used.
+    # -----------------------------------------------------------------------
+    @everywhere arclength(F) = [0.0; cumsum(abs.(diff(F)))]
+
+    # Foot of e on the polyline F, searched on the two segments next to its
+    # nearest node k.  Returns (distance, arclength of the foot).  The two end
+    # segments are not clamped outwards, so eigenvalues beyond F's ends get
+    # s < 0 or s > s_F[end] instead of all collapsing onto the end nodes.
+    @everywhere function foot_on_F(e, F, s_F, k)
+        n = length(F)
+        best_d = Inf
+        best_s = s_F[k]
+        for i in (k - 1, k)
+            (1 <= i && i + 1 <= n) || continue
+            a = F[i]
+            ab = F[i + 1] - a
+            t = real(conj(ab) * (e - a)) / abs2(ab)
+            t = clamp(t, i == 1 ? -Inf : 0.0, i + 1 == n ? Inf : 1.0)
+            dd = abs(e - (a + t * ab))
+            if dd < best_d
+                best_d = dd
+                best_s = s_F[i] + t * abs(ab)
+            end
+        end
+        return best_d, best_s
+    end
+
+    # v8 rev A2: which side test spatial_payload uses.
+    #   :graph  sign of Im(e) - F_interp(Re e) on the polyline (exact, same as
+    #           side_check); node-normal test only for Re(e) outside F's range
+    #   :node   nearest-node normal test everywhere (pointcloud_test.jl)
+    @everywhere const CLOUD_SIDE_TEST = :graph
+
+    @everywhere function spatial_payload(omega, F, normals_F)
+        ev = couetteflow(nothing, omega, Val(:alpha_collocation), Val(:eigvals))
+        ev = ev[[isfinite(real(e)) && isfinite(imag(e)) for e in ev]]
+        s_F = arclength(F)
+        xF  = real.(F)          # strictly increasing: F is a graph
+        nF  = length(F)
+        up = ComplexF64[];  up_d = Float64[];  up_s = Float64[]
+        lo = ComplexF64[];  lo_d = Float64[];  lo_s = Float64[]
+        for e in ev
+            dmin = Inf
+            k = 0
+            @inbounds for t in eachindex(F)
+                dd = abs(e - F[t])
+                if dd < dmin
+                    dmin = dd
+                    k = t
+                end
+            end
+            x = real(e)
+            if CLOUD_SIDE_TEST === :graph && xF[1] <= x <= xF[end]
+                j = clamp(searchsortedlast(xF, x), 1, nF - 1)
+                t = (x - xF[j]) / (xF[j+1] - xF[j])
+                proj = imag(e) - ((1 - t) * imag(F[j]) + t * imag(F[j+1]))
+            else
+                proj = real(conj(normals_F[k]) * (e - F[k]))
+            end
+            d_F, s_e = foot_on_F(e, F, s_F, k)
+            if proj > 0.0
+                push!(up, e);  push!(up_d, d_F);  push!(up_s, s_e)
+            elseif proj < 0.0
+                push!(lo, e);  push!(lo_d, d_F);  push!(lo_s, s_e)
+            end
+        end
+        return (all = ev, up = up, up_d = up_d, up_s = up_s,
+                lo = lo, lo_d = lo_d, lo_s = lo_s)
+    end
+
+    # Same rule as v4.4 dominant_eigvals: on each side, the eigenvalue whose
+    # nearest F point is nearest.  Used for the initial contour and for the
+    # single seed point of the tracking sweep.
+    function dominant_from(pl)
+        eu = isempty(pl.up) ? nothing : pl.up[argmin(pl.up_d)]
+        el = isempty(pl.lo) ? nothing : pl.lo[argmin(pl.lo_d)]
+        return eu, el
+    end
+
+    # -----------------------------------------------------------------------
+    # v4.7 CHANGE 9: continuity wins when the side test contradicts it.
+    #
+    # THE BUG.  spatial_payload decides "upper" or "lower" from the sign of
+    # the projection of (eigenvalue - nearest F node) onto that node's normal.
+    # The resolution of that test is set by F's node spacing.  F is 100 points
+    # over alpha_r in [0,1], so the spacing is ~1.0e-2, while the two branch
+    # points it is being asked to separate are d_branch apart -- 3.2e-3 on the
+    # last frame of the 501-iteration run, and shrinking every time the run
+    # succeeds.  Measured there, at omega index 82 of 141:
+    #
+    #     both near-pinch roots land on the SAME F node (k = 57)
+    #     upper root: |e - F[k]| = 2.07e-3, of which the normal part is
+    #                 -1.64e-4 and the tangential part +2.06e-3
+    #     so the sign that decides the side is set by 1.6e-4 against a node
+    #     spacing of 1.0e-2 -- a margin 62x below the resolution of the
+    #     polyline whose normal is being used.
+    #
+    # Both roots then came out classified `lo`, pl.up held nothing within 0.02
+    # of the pinch, and this function returned the nearest OTHER upper-classed
+    # eigenvalue: 0.685013 - 1.142555i, a jump of 1.899 from alpha_prev.  The
+    # sweep is a chain, so alpha_prev was then wrong for every remaining omega
+    # and the branch stayed latched on that mode to the end of L.  187 of the
+    # 501 logged frames have an upper-branch step > 0.5; it first appears at
+    # iteration 32 and is present on nearly every frame from 101 on.  Whether
+    # it fires depends on where F's nodes happen to fall, which is why it looks
+    # intermittent.
+    #
+    # THE FIX.  Keep the side test -- it is what separates the branches when
+    # they are far apart -- but do not let it move the tracked root by an
+    # amount that pure continuity says is absurd.  If honouring the side
+    # classification costs TRACK_SIDE_SLACK times more movement than the
+    # nearest eigenvalue overall, the classification is what is wrong, not the
+    # continuation, so take the continuation.
+    #
+    # This cannot silently merge the two branches: a swap would need the other
+    # branch to be the nearest root, and near the tip the branches are
+    # d_branch = 3.2e-3 apart while consecutive omega samples move a root by
+    # ~1.7e-4, a ratio of 19.  branch_overlap_valid() is still the backstop.
+    #
+    # Replayed on the recorded iteration-501 geometry, recomputing all 141
+    # spectra: the guard fires 7 times out of 282 selections, the largest
+    # upper-branch step falls from 1.8983 to 0.0857, no step exceeds 0.5, the
+    # branch becomes monotone in Re past the pinch, and d_branch is unchanged
+    # to within the resolution of the check.  Only indices 80-140 -- the tail
+    # after the pinch -- differ; nothing before the pinch moves.
+    #
+    # TRACK_SIDE_SLACK = Inf restores the v4.6/v4.7 behaviour exactly.
+    # -----------------------------------------------------------------------
+    const TRACK_SIDE_SLACK = 10.0   # Inf -> exactly the old behaviour
+    const TRACK_MIN_STEP   = 1e-9   # floor, so a root that barely moved cannot
+                                    # make the ratio blow up on its own
+
+    global track_overrides = 0      # reset by contour_alpha_L_conti
+    global track_jump_u    = 0.0    # largest |d alpha| along the upper branch
+    global track_jump_l    = 0.0    # ... and the lower, set by the same sweep
+
+    # Same rule as v4.4 couetteflow_spatial_sing_mode_comparison with
+    # side_tol = 0: nearest to alpha_prev among the requested side, falling
+    # back to nearest among all finite eigenvalues if that side is empty --
+    # plus the CHANGE 9 continuity guard above.
+    function select_tracked(pl, alpha_prev, side::Symbol)
+        isempty(pl.all) && error("spatial_payload: no finite eigenvalues")
+        ap = ComplexF64(alpha_prev)
+        all_best = pl.all[argmin(abs.(ap .- pl.all))]
+        cand = side === :upper ? pl.up : pl.lo
+        isempty(cand) && return all_best
+        side_best = cand[argmin(abs.(ap .- cand))]
+        if isfinite(TRACK_SIDE_SLACK)
+            d_side = abs(ap - side_best)
+            d_all  = abs(ap - all_best)
+            if d_side > TRACK_SIDE_SLACK * max(d_all, TRACK_MIN_STEP)
+                global track_overrides += 1
+                return all_best
+            end
+        end
+        return side_best
+    end
+
+    # Kept for callers that want one omega on the main process.
+    function dominant_eigvals(omega, F, normals_F)
+        return dominant_from(spatial_payload(omega, F, normals_F))
+    end
+
+    # -----------------------------------------------------------------------
+    # v8 POINT-CLOUD BRANCHES (replaces the v7.2 seed-and-walk below, which
+    # is kept as contour_alpha_L_walk).  From pointcloud_test.jl.
+    #
+    # Every omega in L is one independent eigensolve, done by pmap on the
+    # workers.  The main process then pools ALL classified eigenvalues of all
+    # omegas into two clouds -- cloud_u (+normal side of F) and cloud_l
+    # (-normal side) -- drops the ones of unreasonable magnitude, and takes as
+    # alpha_L_u / alpha_L_l the frontier of each cloud that faces F.
+    #
+    # Nothing is tracked, so nothing can jump to a neighbouring mode, and
+    # there is no seed: whichever mode is closest to F at a given position
+    # along F is on the frontier, from whatever omega it came.
+    #
+    # Frontier.  Each eigenvalue has a foot point on F at arclength s and a
+    # distance d to F (spatial_payload).  The s-range of the cloud is cut into
+    # bins and the minimum-d eigenvalue of each bin is kept.  A bin that holds
+    # no sample of the near branch picks up a farther mode instead, which
+    # shows up as a spike (or zig-zag) away from F.  A frontier point is
+    # dropped when, within CLOUD_WIN bins on BOTH sides, there are points
+    # closer to F by more than the factor 1 + CLOUD_SPIKE_REL; repeated until
+    # nothing changes.  Requiring both sides keeps the steep flanks of a dip
+    # towards F (e.g. near a pinch), where one side is always farther.
+    # The result, ordered by s, is a polyline of actual eigenvalues
+    # (CLOUD_SMOOTH = 0) or a moving average of them (CLOUD_SMOOTH > 0).
+    #
+    # NOTE: the frontier is parametrised by s along F, not by omega, so
+    # alpha_L_u[j] no longer belongs to L[j], and the two branches need not
+    # have the same length.  Quantities that need omega correspondence use
+    # the per-omega pairs pair_u / pair_l built from the same clouds
+    # (cloud_pairs below); see the v8 header.
+    # -----------------------------------------------------------------------
+    const CLOUD_ABS_MAX   = 10.0   # drop |alpha| above this (spurious modes)
+    # v8 fix 1 (2026-10-16): 2.0 -> 5.0.  2.0 came from pointcloud_test.jl
+    # (Poiseuille, Re 5000, branches near the real axis).  Here the lower
+    # branch starts at alpha ~ 0.0x - 3.3i on the initial L (pinch at
+    # alpha_p = 0.5725 - 3.0389i), i.e. d ~ 3.3 from the initial F, so 2.0
+    # emptied the lower cloud at the first sweep.  5.0 keeps that branch and
+    # still excludes the next lower family (~ -6.6i).  Later in the run the
+    # upper branch is ~3 from the part of F that has moved down, so do not
+    # go much below ~4.
+    const CLOUD_DIST_MAX  = 5.0    # drop eigenvalues farther than this from F
+    const CLOUD_NBINS     = 0      # frontier bins along F; 0 -> length(L)
+    const CLOUD_WIN       = 3      # spike filter half-width, in bins
+    const CLOUD_SPIKE_REL = 0.1    # spike if both sides hold a point with
+                                   # d * (1 + CLOUD_SPIKE_REL) < own d
+    const CLOUD_SMOOTH    = 0      # moving-average half-width; 0 = raw eigenvalues
+    const CLOUD_S_PAD     = 0.0    # keep feet up to this fraction of len(F) beyond
+                                   # F's ends; past them the near branch runs out
+                                   # and far modes would form the frontier
+
+    # State of the accepted branch geometry.  Written ONLY by set_branches!,
+    # so all of these always describe the same sweep.
+    global cloud_u       = ComplexF64[]   # filtered clouds, kept for plot_cloud()
+    global cloud_l       = ComplexF64[]
+    global pair_u        = ComplexF64[]   # per-omega pairs, length(L)
+    global pair_l        = ComplexF64[]
+    global front_j_u     = Int[]          # L index each frontier point came from
+    global front_j_l     = Int[]
+    global pair_fallback = 0              # pairs taken from the unfiltered side
+
+    # The cloud filter, shared by gather_cloud and cloud_pairs.
+    cloud_keep(e, d, s, s_min, s_max) =
+        abs(e) <= CLOUD_ABS_MAX && d <= CLOUD_DIST_MAX && s_min <= s <= s_max
+
+    # v8 rev B1: the coordinate the frontier is binned and ordered by.
+    #   :alpha_r    Re(alpha)          (well conditioned at any distance from F)
+    #   :arclength  foot arclength s   (pointcloud_test.jl; degenerates for
+    #                                   points far from F once F has a dip)
+    const CLOUD_COORD = :alpha_r
+
+    cloud_x(e, s) = CLOUD_COORD === :alpha_r ? real(e) : s
+
+    function cloud_s_range()
+        if CLOUD_COORD === :alpha_r
+            x0 = real(F[1]);  x1 = real(F[end]);  W = x1 - x0
+            return x0 - CLOUD_S_PAD * W, x1 + CLOUD_S_PAD * W
+        end
+        S = arclength(F)[end]
+        return -CLOUD_S_PAD * S, (1 + CLOUD_S_PAD) * S
+    end
+
+    # v8: also returns the L index of every kept point (j), so frontier
+    # points can be traced back to their omega.  Filtering is unchanged.
+    function gather_cloud(payloads, side::Symbol)
+        pts = ComplexF64[];  s = Float64[];  d = Float64[];  jj = Int[]
+        s_min, s_max = cloud_s_range()
+        for (j, pl) in enumerate(payloads)
+            e, ss, dd = side === :upper ? (pl.up, pl.up_s, pl.up_d) :
+                                          (pl.lo, pl.lo_s, pl.lo_d)
+            for i in eachindex(e)
+                x = cloud_x(e[i], ss[i])
+                cloud_keep(e[i], dd[i], x, s_min, s_max) || continue
+                push!(pts, e[i]);  push!(s, x);  push!(d, dd[i]);  push!(jj, j)
+            end
+        end
+        return pts, s, d, jj
+    end
+
+    function smooth_polyline(z, w)
+        (w <= 0 || length(z) < 3) && return z
+        out = copy(z)
+        for i in 2:(length(z) - 1)
+            r = min(w, i - 1, length(z) - i)
+            out[i] = sum(@view z[(i - r):(i + r)]) / (2r + 1)
+        end
+        return out
+    end
+
+    # v8: returns (frontier, idx) -- idx are the cloud indices of the kept
+    # points, so the caller can map them to their omega.  Algorithm unchanged.
+    function cloud_frontier(pts, s, d; nbins::Int)
+        isempty(pts) && error("cloud_frontier: empty cloud after filtering " *
+            "(check CLOUD_DIST_MAX / CLOUD_ABS_MAX / CLOUD_S_PAD against where the branch is)")
+        s_lo, s_hi = extrema(s)
+        h = (s_hi - s_lo) / nbins
+        # minimum-d point of each bin
+        best = zeros(Int, nbins)
+        for i in eachindex(s)
+            b = h > 0 ? clamp(floor(Int, (s[i] - s_lo) / h) + 1, 1, nbins) : 1
+            if best[b] == 0 || d[i] < d[best[b]]
+                best[b] = i
+            end
+        end
+        idx = filter(!=(0), best)               # ordered by s
+        # spike filter: drop points with clearly closer points on both sides
+        w = CLOUD_WIN * h
+        for _ in 1:length(idx)
+            keep = trues(length(idx))
+            for a in eachindex(idx)
+                mL = Inf
+                b = a - 1
+                while b >= 1 && s[idx[a]] - s[idx[b]] <= w
+                    mL = min(mL, d[idx[b]]);  b -= 1
+                end
+                mR = Inf
+                b = a + 1
+                while b <= length(idx) && s[idx[b]] - s[idx[a]] <= w
+                    mR = min(mR, d[idx[b]]);  b += 1
+                end
+                keep[a] = d[idx[a]] <= (1 + CLOUD_SPIKE_REL) * max(mL, mR)
+            end
+            all(keep) && break
+            idx = idx[keep]
+        end
+        return smooth_polyline(pts[idx], CLOUD_SMOOTH), idx
+    end
+
+    # v8: per-omega pairs.  At each L[j], the eigenvalue nearest F on each
+    # side among the points that pass the cloud filter -- i.e. that omega's
+    # own contribution to cloud_u / cloud_l.  If a side has none, the
+    # nearest eigenvalue on that side unfiltered (counted); if a side is
+    # empty altogether, an error, exactly as v7.2's contour_alpha_L_init.
+    function cloud_pairs(payloads, L)
+        s_min, s_max = cloud_s_range()
+        pu = Vector{ComplexF64}(undef, length(payloads))
+        pl_ = Vector{ComplexF64}(undef, length(payloads))
+        n_fb = 0
+        for (j, pl) in enumerate(payloads)
+            for side in (:upper, :lower)
+                e, ss, dd = side === :upper ? (pl.up, pl.up_s, pl.up_d) :
+                                              (pl.lo, pl.lo_s, pl.lo_d)
+                isempty(e) && error("cloud_pairs: empty $(side) side at omega = $(L[j])")
+                best = 0
+                for i in eachindex(e)
+                    cloud_keep(e[i], dd[i], cloud_x(e[i], ss[i]), s_min, s_max) || continue
+                    (best == 0 || dd[i] < dd[best]) && (best = i)
+                end
+                if best == 0
+                    best = argmin(dd)
+                    n_fb += 1
+                end
+                side === :upper ? (pu[j] = e[best]) : (pl_[j] = e[best])
+            end
+        end
+        return pu, pl_, n_fb
+    end
+
+    # One sweep.  Returns everything as a NamedTuple and changes NO global
+    # state, so a rejected omega trial cannot leave anything behind.
+    function contour_alpha_L_cloud(L)
+        payloads = pmap(w -> spatial_payload(w, F, normals_F), L)
+        nb = CLOUD_NBINS > 0 ? CLOUD_NBINS : length(L)
+        cu, su, du, ju = gather_cloud(payloads, :upper)
+        cl, sl, dl, jl = gather_cloud(payloads, :lower)
+        isempty(cu) && error("contour_alpha_L_cloud: UPPER cloud empty after filtering")
+        isempty(cl) && error("contour_alpha_L_cloud: LOWER cloud empty after filtering")
+        au, iu = cloud_frontier(cu, su, du; nbins = nb)
+        al, il = cloud_frontier(cl, sl, dl; nbins = nb)
+        (length(au) < 2 || length(al) < 2) &&
+            error(@sprintf("contour_alpha_L_cloud: frontier too short (upper %d, lower %d points); Phi_F needs >= 2",
+                           length(au), length(al)))
+        pu, pl, n_fb = cloud_pairs(payloads, L)
+        return (u = au, l = al, pu = pu, pl = pl, ju = ju[iu], jl = jl[il],
+                cu = cu, cl = cl, fallback = n_fb)
+    end
+
+    # Install a sweep as the current branch geometry.
+    function set_branches!(br)
+        global alpha_L_u     = br.u
+        global alpha_L_l     = br.l
+        global pair_u        = br.pu
+        global pair_l        = br.pl
+        global front_j_u     = br.ju
+        global front_j_l     = br.jl
+        global cloud_u       = br.cu
+        global cloud_l       = br.cl
+        global pair_fallback = br.fallback
+        global track_overrides = 0
+        global track_jump_u  = length(alpha_L_u) < 2 ? 0.0 : maximum(abs.(diff(alpha_L_u)))
+        global track_jump_l  = length(alpha_L_l) < 2 ? 0.0 : maximum(abs.(diff(alpha_L_l)))
+        return nothing
+    end
+
+    function contour_alpha_L_init(L)
+        br = contour_alpha_L_cloud(L)
+        @everywhere alpha_L_u = Complex{Float64}[]
+        @everywhere alpha_L_l = Complex{Float64}[]
+        return br
+    end
+
+    # Same name the iteration loop calls.  v8: returns the NamedTuple.
+    contour_alpha_L_conti(L) = contour_alpha_L_cloud(L)
+
+    # -----------------------------------------------------------------------
+    # v7.2 seed-and-walk (v4.5 contour_alpha_L_conti), kept for comparison
+    # with the cloud frontier and for verify_fast_path().  NOT used by the
+    # loop.  Same selection as v7.2; the only difference is that up_d / lo_d
+    # in the payload are now polyline distances, which only enters the
+    # choice of the seed (dominant_from).  Writes track_overrides as before.
+    # -----------------------------------------------------------------------
+    function contour_alpha_L_walk(L)
+        payloads = pmap(w -> spatial_payload(w, F, normals_F), L)
+
+        # Same physical starting omega as the old 100-point grid
+        omega_start_target = omega_r_base[25]
+        s = argmin(abs.(real.(L) .- omega_start_target))
+
+        au = Vector{ComplexF64}(undef, length(L))
+        al = Vector{ComplexF64}(undef, length(L))
+
+        eu, el = dominant_from(payloads[s])
+        (eu === nothing || el === nothing) &&
+            error("contour_alpha_L_walk: empty branch side at the seed omega = $(L[s])")
+        au[s] = eu
+        al[s] = el
+
+        global track_overrides = 0
+
+        for j in (s + 1):length(L)
+            au[j] = select_tracked(payloads[j], au[j - 1], :upper)
+            al[j] = select_tracked(payloads[j], al[j - 1], :lower)
+        end
+        for j in (s - 1):-1:1
+            au[j] = select_tracked(payloads[j], au[j + 1], :upper)
+            al[j] = select_tracked(payloads[j], al[j + 1], :lower)
+        end
+        return au, al
+    end
+
+    #######################
+    # v4.4 REFERENCE PATH #
+    #######################
+    # Kept verbatim so verify_fast_path() has something to compare against.
+    @everywhere function track_eigenvalue_simple(alpha_0)
+        return alpha_0
+    end
+    @everywhere function track_branch_pmap(L, start_index, alpha_0, direction, branch_side)
+        N = length(L)
+        alpha_current = alpha_0
+        current_index = start_index
+        results = [(start_index, alpha_current)]
+        while 1 <= current_index + direction <= N && current_index + direction >= 1
+            indices_segment = current_index + direction:direction:current_index + direction
+            L_segment = L[indices_segment]
+            args = [(idx, omega, alpha_current) for (idx, omega) in zip(indices_segment, L_segment)]
+            tracked = pmap(arg -> begin
+                index, omega, alpha_prev = arg
+                alpha_tracked = track_eigenvalue_simple(alpha_prev)
+                alpha_corrected = couetteflow_spatial_sing_mode_comparison(
+                    omega, alpha_tracked, branch_side, F, normals_F)
+                (index, alpha_corrected)
+            end, args)
+            result = tracked[1]
+            push!(results, result)
+            alpha_current = result[2]
+            current_index = result[1]
+        end
+        return results
+    end
+    function contour_alpha_L_conti_ref(L)
+        omega_start_target = omega_r_base[25]
+        start_index = argmin(abs.(real.(L) .- omega_start_target))
+        alpha_u_start, alpha_l_start = dominant_eigvals(L[start_index], F, normals_F)
+        future_u_fwd = @spawn track_branch_pmap(L, start_index, alpha_u_start, +1, :upper)
+        future_u_bwd = @spawn track_branch_pmap(L, start_index, alpha_u_start, -1, :upper)
+        future_l_fwd = @spawn track_branch_pmap(L, start_index, alpha_l_start, +1, :lower)
+        future_l_bwd = @spawn track_branch_pmap(L, start_index, alpha_l_start, -1, :lower)
+        results_u = vcat(fetch(future_u_bwd), fetch(future_u_fwd)[2:end])
+        results_l = vcat(fetch(future_l_bwd), fetch(future_l_fwd)[2:end])
+        sort!(results_u, by = x -> x[1])
+        sort!(results_l, by = x -> x[1])
+        return [x[2] for x in results_u], [x[2] for x in results_l]
+    end
+
+    set_branches!(contour_alpha_L_init(L))
+    load_on_workers()
+
+    #########
+    # PLOTS #
+    #########
+    function plot_omega()
+        plot(L)
+        plot!(omega_F)
+    end
+    function plot_alpha()
+        plot(F)
+        plot!(alpha_L_u)
+        plot!(alpha_L_l, color=3)
+    end
+    # v8: both clouds of the last ACCEPTED sweep, with F and the frontiers.
+    function plot_cloud()
+        scatter(real.(cloud_u), imag.(cloud_u); ms=1.5, msw=0, alpha=0.4, label="cloud u")
+        scatter!(real.(cloud_l), imag.(cloud_l); ms=1.5, msw=0, alpha=0.4, label="cloud l")
+        plot!(real.(F), imag.(F); color=:black, label="F")
+        plot!(real.(alpha_L_u), imag.(alpha_L_u); lw=2, label="alpha_L_u")
+        plot!(real.(alpha_L_l), imag.(alpha_L_l); lw=2, label="alpha_L_l")
+        scatter!(real.(pair_u), imag.(pair_u); ms=2, msw=0, label="pair_u")
+        scatter!(real.(pair_l), imag.(pair_l); ms=2, msw=0, label="pair_l")
+    end
+    function reset()
+        global alpha_r = collect(range(alpha_r_start, alpha_r_end, length=N))   # rev B
+        global alpha_i = fill(0.0, N)
+        global F = contour_F()
+        global omega_F = contour_omega_F(F)
+        global omega_i = 0.0
+        global omega_r = copy(omega_r_base)
+        global adapt_level  = 0
+        global adapt_nogain = 0
+        global adapt_done   = false
+        adapt_reset_history!()
+        push_omega_r()
+        global L = contour_L()
+        load_on_workers()
+        @everywhere begin
+            global normals_F = contour_normals(F)
+        end
+        set_branches!(contour_alpha_L_init(L))
+        load_on_workers()
+        iteration_step = 1
+    end
+end
+
+# ---------------------------------------------------------------------------
+# EQUIVALENCE CHECK.  Run once after loading, before starting a long run:
+#
+#     verify_fast_path()
+#
+# It compares the v4.5 selection against the v4.4 code path on the current L
+# and prints the largest absolute difference on each branch.  Expect exactly
+# 0.0 -- the eigenvalues come from the same LAPACK routine on the same
+# matrices and only the selection was reorganised.  A difference at the 1e-16
+# level would still be acceptable (ggev with and without vectors may order a
+# degenerate pair differently); anything larger means the refactor is wrong.
+#
+# v8: the loop no longer walks, so this now checks contour_alpha_L_walk (the
+# v7.2 selection, kept for comparison) against the v4.4 path.  It says
+# nothing about the cloud frontier, which pairs nothing by index; use
+# plot_cloud() for that.  The walk's seed is chosen with the polyline
+# distance, so on an unusual geometry its seed -- and then the whole walk --
+# could differ from the reference.
+# ---------------------------------------------------------------------------
+function verify_fast_path(L_test = L)
+    @printf("verify_fast_path: %d points, this runs BOTH paths and is slow.\n", length(L_test))
+    flush(stdout)
+    t_fast = @elapsed (au_f, al_f) = contour_alpha_L_walk(L_test)
+    t_ref  = @elapsed (au_r, al_r) = contour_alpha_L_conti_ref(L_test)
+    du = maximum(abs.(au_f .- au_r))
+    dl = maximum(abs.(al_f .- al_r))
+    @printf("  max |upper_fast - upper_ref| = %.3e\n", du)
+    @printf("  max |lower_fast - lower_ref| = %.3e\n", dl)
+    @printf("  fast %.2f s | ref %.2f s | speedup %.1fx\n", t_fast, t_ref, t_ref / t_fast)
+    flush(stdout)
+    return du, dl
+end
+
+######################
+# POTENTIAL FUNCTION #
+######################
+begin
+    s_omega = 2.0
+    s_alpha = 2.0
+    epsilon = 1e-10
+
+    global zeta_common = 4e-4
+    global zeta_omega = zeta_common
+    global zeta_alpha = zeta_common
+
+    # -----------------------------------------------------------------------
+    # v4.3a OVERFLOW GUARD  (fixes the LAPACKException(150) crash at k = 122)
+    # exp(zeta/(d^s + epsilon)) overflows once d = |alpha_F - alpha_L| < 7.5e-4.
+    # Both d_d_alpha_r_Phi_F and d_d_alpha_i_Phi_F carry the same exp factor and
+    # enter rhs_j with opposite signs, so the numerator becomes (+Inf) + (-Inf)
+    # = NaN, and clamp(NaN, -100, 100) === NaN passes it straight through into
+    # alpha_i -> F -> eigen(A, B) -> LAPACK INFO = N = 150.
+    #
+    # v4.5 note: with zeta fixed at 4e-4 the repulsion length is sqrt(zeta) =
+    # 0.02, and F has to thread the gap between the two branches, so it must
+    # sit within ~d/2 of each.  On the v4.4 run F sat 1.3e-2 from the upper
+    # branch at d = 3.08e-2, giving zeta/r^2 ~ 2 -- harmless.  At d = 1e-3 the
+    # same geometry gives zeta/r^2 = 1600, i.e. past EXP_ARG_MAX with rhs_j
+    # pinned at rhs_cap over the whole neighbourhood.  The scaling that
+    # reproduces the current hand-tuned value is zeta ~ d^2/2 (d = 3.08e-2
+    # gives 4.7e-4 against the 4e-4 set here).  NOT implemented in v4.5: it is
+    # the next change, and it should not be mixed into the same run as the
+    # grid change.  Watch d_contour and the exp arguments once d_branch drops
+    # below ~1e-2.
+    # -----------------------------------------------------------------------
+    const EXP_ARG_MAX = 400.0
+    expc(x) = exp(x < EXP_ARG_MAX ? x : EXP_ARG_MAX)
+
+    function phi_L(omega_L, omega)
+        phi_L = 0.0
+        phi_L = exp(zeta_omega / (abs(omega_L - omega)^s_omega + epsilon)) - 1.0
+        return phi_L
+    end
+    function Phi_L(omega_L)
+        Phi_L = 0.0
+        d_omega_1 = omega_F[2] - omega_F[1]
+        Phi_L += phi_L(omega_L, omega_F[1]) * abs(d_omega_1)
+        for j in 2:(length(omega_F) - 1)
+            d_omega_j = 0.5 * (omega_F[j+1] - omega_F[j-1])
+            Phi_L += phi_L(omega_L, omega_F[j]) * abs(d_omega_j)
+        end
+        d_omega_N = omega_F[end] - omega_F[end-1]          # rev B: was [N]
+        Phi_L += phi_L(omega_L, omega_F[end]) * abs(d_omega_N)
+        return Phi_L
+    end
+    function phi_F(alpha_F, alpha)
+        phi_F = 0.0
+        phi_F = expc(zeta_alpha / (abs(alpha_F - alpha)^s_alpha + epsilon)) - 1.0
+        return phi_F
+    end
+    # NOTE on the adaptive grid: Phi_F and its gradients weight every alpha_L
+    # point by the local arc length |0.5 (alpha[j+1] - alpha[j-1])|, so
+    # clustering L points near the pinch does not change the potential -- it
+    # only resolves the same charge distribution better.  Near the cusp
+    # |dalpha/domega| ~ |omega - omega_p|^(-1/2) diverges, so the arc length
+    # per omega cell GROWS towards the pinch and v4.4's uniform spacing was
+    # under-resolving exactly the part that carries the most weight.
+    function Phi_F(alpha_F)
+        Phi_F = 0.0
+        d_alpha_u_1 = alpha_L_u[2] - alpha_L_u[1]
+        Phi_F += phi_F(alpha_F, alpha_L_u[1]) * abs(d_alpha_u_1)
+        for j in 2:(length(alpha_L_u) - 1)
+            d_alpha_u_j = 0.5 * (alpha_L_u[j+1] - alpha_L_u[j-1])
+            Phi_F += phi_F(alpha_F, alpha_L_u[j]) * abs(d_alpha_u_j)
+        end
+        d_alpha_u_N = alpha_L_u[end] - alpha_L_u[end-1]
+        Phi_F += phi_F(alpha_F, alpha_L_u[end]) * abs(d_alpha_u_N)
+        ######
+        d_alpha_l_1 = alpha_L_l[2] - alpha_L_l[1]
+        Phi_F += phi_F(alpha_F, alpha_L_l[1]) * abs(d_alpha_l_1)
+        for j in 2:(length(alpha_L_l) - 1)
+            d_alpha_l_j = 0.5 * (alpha_L_l[j+1] - alpha_L_l[j-1])
+            Phi_F += phi_F(alpha_F, alpha_L_l[j]) * abs(d_alpha_l_j)
+        end
+        d_alpha_l_N = alpha_L_l[end] - alpha_L_l[end-1]
+        Phi_F += phi_F(alpha_F, alpha_L_l[end]) * abs(d_alpha_l_N)
+        return Phi_F
+    end
+    ###############################
+    # POTENTIAL FUNCTION GRADIENT #
+    ###############################
+    function d_d_omega_r_phi_L(omega_L, omega)
+        d_d_omega_r_phi_L = 0.0
+        d_d_omega_r_phi_L = -zeta_omega * (real(omega_L) - real(omega)) * s_omega * abs(omega_L - omega)^(s_omega - 2) / (abs(omega_L - omega)^s_omega + epsilon)^2.0 * exp(zeta_omega / (abs(omega_L - omega)^s_omega + epsilon))
+        return d_d_omega_r_phi_L
+    end
+    function d_d_omega_r_Phi_L(omega_L)
+        d_d_omega_r_Phi_L = 0.0
+        d_omega_1 = omega_F[2] - omega_F[1]
+        d_d_omega_r_Phi_L += d_d_omega_r_phi_L(omega_L, omega_F[1]) * abs(d_omega_1)
+        for j in 2:(length(omega_F) - 1)
+            d_omega_j = 0.5 * (omega_F[j+1] - omega_F[j-1])
+            d_d_omega_r_Phi_L += d_d_omega_r_phi_L(omega_L, omega_F[j]) * abs(d_omega_j)
+        end
+        d_omega_N = omega_F[end] - omega_F[end-1]          # rev B: was [N]
+        d_d_omega_r_Phi_L += d_d_omega_r_phi_L(omega_L, omega_F[end]) * abs(d_omega_N)
+        return d_d_omega_r_Phi_L
+    end
+    #
+    function d_d_omega_i_phi_L(omega_L, omega)
+        d_d_omega_i_phi_L = 0.0
+        d_d_omega_i_phi_L = -zeta_omega * (imag(omega_L) - imag(omega)) * s_omega * abs(omega_L - omega)^(s_omega - 2) / (abs(omega_L - omega)^s_omega + epsilon)^2.0 * exp(zeta_omega / (abs(omega_L - omega)^s_omega + epsilon))
+        return d_d_omega_i_phi_L
+    end
+    function d_d_omega_i_Phi_L(omega_L)
+        d_d_omega_i_Phi_L = 0.0
+        d_omega_1 = omega_F[2] - omega_F[1]
+        d_d_omega_i_Phi_L += d_d_omega_i_phi_L(omega_L, omega_F[1]) * abs(d_omega_1)
+        for j in 2:(length(omega_F) - 1)
+            d_omega_j = 0.5 * (omega_F[j+1] - omega_F[j-1])
+            d_d_omega_i_Phi_L += d_d_omega_i_phi_L(omega_L, omega_F[j]) * abs(d_omega_j)
+        end
+        d_omega_N = omega_F[end] - omega_F[end-1]          # rev B: was [N]
+        d_d_omega_i_Phi_L += d_d_omega_i_phi_L(omega_L, omega_F[end]) * abs(d_omega_N)
+        return d_d_omega_i_Phi_L
+    end
+    ###
+    function d_d_alpha_r_phi_F(alpha_F, alpha)
+        d_d_alpha_r_phi_F = 0.0
+        d_d_alpha_r_phi_F = -zeta_alpha * (real(alpha_F) - real(alpha)) * s_alpha * abs(alpha_F - alpha)^(s_alpha - 2) / (abs(alpha_F - alpha)^s_alpha + epsilon)^2.0 * expc(zeta_alpha / (abs(alpha_F - alpha)^s_alpha + epsilon))
+        return d_d_alpha_r_phi_F
+    end
+    function d_d_alpha_r_Phi_F(alpha_F)
+        d_d_alpha_r_Phi_F = 0.0
+        d_alpha_u_1 = alpha_L_u[2] - alpha_L_u[1]
+        d_d_alpha_r_Phi_F += d_d_alpha_r_phi_F(alpha_F, alpha_L_u[1]) * abs(d_alpha_u_1)
+        for j in 2:(length(alpha_L_u) - 1)
+            d_alpha_u_j = 0.5 * (alpha_L_u[j+1] - alpha_L_u[j-1])
+            d_d_alpha_r_Phi_F += d_d_alpha_r_phi_F(alpha_F, alpha_L_u[j]) * abs(d_alpha_u_j)
+        end
+        d_alpha_u_N = alpha_L_u[end] - alpha_L_u[end-1]
+        d_d_alpha_r_Phi_F += d_d_alpha_r_phi_F(alpha_F, alpha_L_u[end]) * abs(d_alpha_u_N)
+        ######
+        d_alpha_l_1 = alpha_L_l[2] - alpha_L_l[1]
+        d_d_alpha_r_Phi_F += d_d_alpha_r_phi_F(alpha_F, alpha_L_l[1]) * abs(d_alpha_l_1)
+        for j in 2:(length(alpha_L_l) - 1)
+            d_alpha_l_j = 0.5 * (alpha_L_l[j+1] - alpha_L_l[j-1])
+            d_d_alpha_r_Phi_F += d_d_alpha_r_phi_F(alpha_F, alpha_L_l[j]) * abs(d_alpha_l_j)
+        end
+        d_alpha_l_N = alpha_L_l[end] - alpha_L_l[end-1]
+        d_d_alpha_r_Phi_F += d_d_alpha_r_phi_F(alpha_F, alpha_L_l[end]) * abs(d_alpha_l_N)
+        return d_d_alpha_r_Phi_F
+    end
+    #
+    function d_d_alpha_i_phi_F(alpha_F, alpha)
+        d_d_alpha_i_phi_F = 0.0
+        d_d_alpha_i_phi_F = -zeta_alpha * (imag(alpha_F) - imag(alpha)) * s_alpha * abs(alpha_F - alpha)^(s_alpha - 2) / (abs(alpha_F - alpha)^s_alpha + epsilon)^2.0 * expc(zeta_alpha / (abs(alpha_F - alpha)^s_alpha + epsilon))
+        return d_d_alpha_i_phi_F
+    end
+    function d_d_alpha_i_Phi_F(alpha_F)
+        d_d_alpha_i_Phi_F = 0.0
+        d_alpha_u_1 = alpha_L_u[2] - alpha_L_u[1]
+        d_d_alpha_i_Phi_F += d_d_alpha_i_phi_F(alpha_F, alpha_L_u[1]) * abs(d_alpha_u_1)
+        for j in 2:(length(alpha_L_u) - 1)
+            d_alpha_u_j = 0.5 * (alpha_L_u[j+1] - alpha_L_u[j-1])
+            d_d_alpha_i_Phi_F += d_d_alpha_i_phi_F(alpha_F, alpha_L_u[j]) * abs(d_alpha_u_j)
+        end
+        d_alpha_u_N = alpha_L_u[end] - alpha_L_u[end-1]
+        d_d_alpha_i_Phi_F += d_d_alpha_i_phi_F(alpha_F, alpha_L_u[end]) * abs(d_alpha_u_N)
+        ######
+        d_alpha_l_1 = alpha_L_l[2] - alpha_L_l[1]
+        d_d_alpha_i_Phi_F += d_d_alpha_i_phi_F(alpha_F, alpha_L_l[1]) * abs(d_alpha_l_1)
+        for j in 2:(length(alpha_L_l) - 1)
+            d_alpha_l_j = 0.5 * (alpha_L_l[j+1] - alpha_L_l[j-1])
+            d_d_alpha_i_Phi_F += d_d_alpha_i_phi_F(alpha_F, alpha_L_l[j]) * abs(d_alpha_l_j)
+        end
+        d_alpha_l_N = alpha_L_l[end] - alpha_L_l[end-1]
+        d_d_alpha_i_Phi_F += d_d_alpha_i_phi_F(alpha_F, alpha_L_l[end]) * abs(d_alpha_l_N)
+        return d_d_alpha_i_Phi_F
+    end
+    function plot_omega_potential()
+        x = real.(L)
+        y = imag.(L)
+        u = [d_d_omega_r_Phi_L(omega) for omega in L]
+        v = [d_d_omega_i_Phi_L(omega) for omega in L]
+        quiver(x, y, quiver=(u, v); xlims=(omega_r_start, omega_r_end))
+        plot!(omega_F)
+    end
+    function plot_alpha_potential()
+        x = real.(F)
+        y = imag.(F)
+        u = [d_d_alpha_r_Phi_F(alpha) for alpha in F]
+        v = [d_d_alpha_i_Phi_F(alpha) for alpha in F]
+        quiver(x, y, quiver=(u, v); xlims=(alpha_r_start, alpha_r_end))
+        plot!(alpha_L_u)
+        plot!(alpha_L_l)
+    end
+    function influence_ratio(alpha_F, alpha_L_u, alpha_L_l)
+        infl_u = 0.0
+        infl_l = 0.0
+        d_alpha_u_1 = alpha_L_u[2] - alpha_L_u[1]
+        infl_u += phi_F(alpha_F, alpha_L_u[1]) * abs(d_alpha_u_1)
+        for j in 2:(length(alpha_L_u)-1)
+            d_alpha_u_j = 0.5 * (alpha_L_u[j+1] - alpha_L_u[j-1])
+            infl_u += phi_F(alpha_F, alpha_L_u[j]) * abs(d_alpha_u_j)
+        end
+        infl_u += phi_F(alpha_F, alpha_L_u[end]) * abs(alpha_L_u[end] - alpha_L_u[end-1])
+        d_alpha_l_1 = alpha_L_l[2] - alpha_L_l[1]
+        infl_l += phi_F(alpha_F, alpha_L_l[1]) * abs(d_alpha_l_1)
+        for j in 2:(length(alpha_L_l)-1)
+            d_alpha_l_j = 0.5 * (alpha_L_l[j+1] - alpha_L_l[j-1])
+            infl_l += phi_F(alpha_F, alpha_L_l[j]) * abs(d_alpha_l_j)
+        end
+        infl_l += phi_F(alpha_F, alpha_L_l[end]) * abs(alpha_L_l[end] - alpha_L_l[end-1])
+        ratio = infl_l / (infl_u + infl_l + eps())
+        return ratio
+    end
+    function acceptance_factor(alpha_F, alpha_L_u, alpha_L_l)
+        r = influence_ratio(alpha_F, alpha_L_u, alpha_L_l)
+        closeness = 4 * r * (1 - r)
+        factor = 10.0 - 9.99 * closeness
+        return factor
+    end
+end
+#################
+# TIME-STEPPING #
+#################
+begin
+    lambda = 4.0       # much stronger downward push
+    sigma = 3e-5       # weaker smoothing/diffusion on F
+    delta_t = 1e-3     # aggressive initial pseudo-time step
+    function spectral_filter(alpha_i, cutoff_fraction)
+        x = alpha_i
+        X = fft(x)
+        N = length(X)
+        cutoff = floor(Int, cutoff_fraction * N/2)
+        X[cutoff+1:end-cutoff] .= 0
+        x_filtered = real(ifft(X))
+        return x_filtered
+    end
+    function rolling_average_filter(x, window_radius)
+        N = length(x)
+        x_smooth = similar(x)
+        for i in 1:N
+            # Determine window bounds (handle edges safely)
+            left = max(1, i - window_radius)
+            right = min(N, i + window_radius)
+            x_smooth[i] = mean(x[left:right])
+        end
+        return x_smooth
+    end
+    function smooth_alpha_curve(x; radius=3, passes=2)
+        y = copy(x)
+        for _ in 1:passes
+            y = rolling_average_filter(y, radius)
+            y[1] = y[2]
+            y[end] = y[end-1]
+        end
+        return y
+    end
+    function complexvec_to_json(vec)
+        return [Dict("re" => real(x), "im" => imag(x)) for x in vec]
+    end
+    # v4.6: JSON.jl does not round-trip NaN/Inf, and this file is re-parsed on
+    # every iteration (read - push - write), so one NaN would break the run at
+    # the next save.  Non-finite diagnostics are stored as null.
+    jsonnum(x) = (x isa Real && isfinite(x)) ? x : nothing
+    filename = "contour_iteration_v8.jsonl"
+end
+
+# ---------------------------------------------------------------------------
+# v4.7 CHANGE 5:  zeta_alpha scaled with the branch gap.
+#
+# WHY.  phi_F = exp(zeta_alpha / r^2) - 1 is what keeps F off the branch
+# points, and sqrt(zeta_alpha) is the RANGE of that repulsion.  But F has to
+# thread BETWEEN the two branch points, so it must sit at r ~ d_branch/2 from
+# each, where the exponent is
+#
+#     zeta_alpha / (d_branch/2)^2  =  4 zeta_alpha / d_branch^2
+#
+# With zeta_alpha frozen at 4e-4 that exponent grows as 1/d^2.  Harmless at the
+# d = 3.1e-2 the value was hand-tuned at (exponent ~1.7); past EXP_ARG_MAX =
+# 400 by d ~ 2e-3, where expc clips and the force is wrong over the whole
+# neighbourhood.  sqrt(4e-4) = 0.02 is the repulsion range, and by then the gap
+# F must fit through is 5e-3 -- four times narrower.
+#
+# THE v4.6 RUN HIT EXACTLY THIS, and section 5 of the v4.5 design note called
+# it in advance ("watch d_contour and the exp arguments once d_branch drops
+# below ~1e-2").  Over its last 156 iterations, at level 6:
+#
+#     zeta/r^2 past EXP_ARG_MAX on 26 of them, past 100 far more often
+#     min |F - branch| down to 7.6e-4
+#     threading ratio (|F-au| + |F-al|)/d degraded from 1.00 to 1.1 - 2.5
+#     max Im(omega_F) therefore drifted UP, pushing omega_i from 1.2e-6 to
+#       4.9e-6 ABOVE the pinch -- and that, not the grid, is what now sets
+#       d_branch: the omega_i offset alone forces d = 9.6e-3 against the
+#       9.3e-3 observed, while the grid (h = 3.8e-7, miss 2.3e-7) would
+#       allow 2.1e-3.
+#     frame-to-frame jitter 2.7e-3 against the K/d round-off prediction of
+#       3.6e-4 -- 7.5x too large to be arithmetic.  That is F being kicked,
+#       not the double-precision floor, so there is real headroom left.
+#
+# THE FIX.  Hold the exponent at the geometry F actually has to occupy fixed,
+# rather than the length sqrt(zeta):
+#
+#     zeta_target(d) = ZETA_REF * (d / ZETA_D_REF)^2
+#
+# calibrated on the one setting known to work -- zeta = 4e-4 at d = 3.08e-2,
+# the v4.4/v4.5 plateau, where the threading ratio was 1.00 and the exponent
+# ~1.7.  Capped at ZETA_REF so it can only ever shrink from the hand-tuned
+# value as the gap closes; cap and formula meet exactly at the calibration
+# point, so there is no discontinuity.
+#
+# STABILITY.  This closes a loop: zeta -> F -> omega_F -> omega_i -> d_branch
+# -> zeta.  Two guards.  The input is a running MEDIAN of d_branch, because the
+# raw value swings +-40 % frame to frame at this level and zeta ~ d^2 would
+# square that into a +-80 % kick every iteration.  And zeta is rate-limited to
+# ZETA_RATE per iteration, so the potential never jumps under F: 4e-4 down to
+# the 4e-7 that d = 1e-3 asks for takes ~230 iterations at 3 %.
+#
+# NOTHING HERE KNOWS WHERE THE PINCH IS.  d_branch is a measured separation
+# between two tracked branches; ZETA_REF and ZETA_D_REF are a working setting
+# taken from this project's own run history; and the d^2 law comes from the
+# requirement that F fit between two branch points, not from where those
+# branch points are.  Set ZETA_ADAPTIVE = false and zeta_alpha stays at 4e-4,
+# i.e. exactly v4.6.
+# ---------------------------------------------------------------------------
+const ZETA_ADAPTIVE = true
+const ZETA_REF      = 4.0e-4     # the hand-tuned value ...
+const ZETA_D_REF    = 3.08e-2    # ... and the d_branch it was measured healthy at
+const ZETA_MIN      = 1.0e-12    # numerical floor; not expected to bind
+const ZETA_RATE     = 0.03       # maximum fractional change per iteration
+const ZETA_WINDOW   = 25         # iterations in the running median of d_branch
+
+global zeta_hist_d = Float64[]
+
+function zeta_push_d!(d)
+    isfinite(d) || return nothing
+    push!(zeta_hist_d, d)
+    while length(zeta_hist_d) > ZETA_WINDOW
+        popfirst!(zeta_hist_d)
+    end
+    return nothing
+end
+
+# Target zeta for a given (smoothed) gap, capped at the hand-tuned value.
+zeta_target(d) = clamp(ZETA_REF * (d / ZETA_D_REF)^2, ZETA_MIN, ZETA_REF)
+
+# One rate-limited step of zeta_alpha towards that target.  Returns zeta
+# unchanged while the adaptation is off or the median window is not yet full,
+# so the first ZETA_WINDOW iterations run at exactly the v4.6 value.
+function zeta_step(zeta_now)
+    (!ZETA_ADAPTIVE || length(zeta_hist_d) < ZETA_WINDOW) && return zeta_now
+    dm = median(zeta_hist_d)
+    (isfinite(dm) && dm > 0) || return zeta_now
+    zt = zeta_target(dm)
+    return clamp(zt, zeta_now * (1.0 - ZETA_RATE), zeta_now * (1.0 + ZETA_RATE))
+end
+
+# ---------------------------------------------------------------------------
+# v4.4 omega-descent controls (unchanged)
+# ---------------------------------------------------------------------------
+const OMEGA_BISECT        = true    # false -> exactly the v4.3 omega update
+const OMEGA_GAP_TARGET    = 1e-8    # wanted omega_i - max(imag(omega_F))
+# v4.6 CHANGE 3.  Was 1e-3.  On the v4.5 run omega_i overshoots UPWARD on 563
+# of the 1752 iterations after k = 250 (32 %), landing 2e-3 to 4.3e-3 above the
+# bound, and 561 of those 563 had a gap ABOVE 1e-3 -- so the bisection, which
+# exists to pull omega_i back down, refused to engage on exactly the iterations
+# that needed it.  Max gap after k = 100 is 4.9e-3, so 1e-2 covers every
+# overshoot.  Cost is near zero: probe 1 tries omega_lower_bound itself, which
+# on a recovery frame is admissible, so the loop breaks after one probe (v4.5
+# averaged 0.35 probes/iteration with a maximum of 1).
+const OMEGA_BISECT_ENGAGE = 1e-2    # only bisect once the gap is below this
+const OMEGA_BISECT_MAX    = 25      # probes per iteration (each = 1 branch track)
+const OMEGA_BISECT_TOL    = 1e-12   # stop when the bracket is this narrow
+const OMEGA_BISECT_MIN_DFC = 0.0
+
+# ---------------------------------------------------------------------------
+# v4.6 CHANGE 2:  parabolic peak of Im(omega_F) for omega_lower_bound.
+#
+# omega_lower_bound was maximum(imag.(omega_F)) -- a maximum over 100 discrete
+# F nodes.  On the v4.5 final frames the true peak sits 0.28 of a node spacing
+# away from the nearest node, so the discrete maximum under-reports it by
+# 9.7e-7 and omega_i is allowed that far BELOW Im(omega_p), past the optimum.
+#
+# The contour itself is not the problem: a 3-point parabola through the peak
+# gives -0.572829718733 against the analytic Im(omega_p) = -0.572829694809,
+# i.e. 2.4e-8.  Measured on v4.5 frames 700..2000:
+#
+#     discrete max  - Im(omega_p) :  -8.0e-7 ... -1.2e-6
+#     parabolic max - Im(omega_p) :  -3.1e-9 ... -4.2e-8
+#
+# That moves the ceiling this error puts on d_min from 4.4e-3 to 6.7e-4.
+# Fitting in index rather than arclength is fine here: F node spacing is
+# 1.0100e-2 to 1.0330e-2, and the two give the same answer to 4e-9.
+#
+# The estimate is always >= the discrete maximum, so the bound only ever moves
+# UP -- the conservative direction.  Guarded: a non-peak (den >= 0), a vertex
+# more than one node away, or a non-finite result falls back to the discrete
+# maximum, i.e. to exact v4.5 behaviour.
+# ---------------------------------------------------------------------------
+const OMEGA_LB_PARABOLIC = true
+
+function omegaF_peak_imag(omega_F, xs = alpha_r)
+    y = imag.(omega_F)
+    j = argmax(y)
+    (!OMEGA_LB_PARABOLIC || j == firstindex(y) || j == lastindex(y)) && return y[j]
+    y0, y1, y2 = y[j-1], y[j], y[j+1]
+    # rev B: on a non-uniform triple fit the parabola in alpha_r.  A uniform
+    # triple takes the original index-space formula below, unchanged.
+    if length(xs) == length(y)
+        hm = xs[j] - xs[j-1]
+        hp = xs[j+1] - xs[j]
+        if abs(hp - hm) > F_UNIFORM_RTOL * max(hp, hm)
+            s0 = (y1 - y0) / hm
+            s1 = (y2 - y1) / hp
+            a  = (s1 - s0) / (hm + hp)          # p(t) = y1 + b t + a t^2
+            a >= 0 && return y1
+            b  = s0 + a * hm
+            t  = -b / (2 * a)
+            (!isfinite(t) || abs(t) > max(hm, hp)) && return y1
+            ypk = y1 - b^2 / (4 * a)
+            return (isfinite(ypk) && ypk >= y1) ? ypk : y1
+        end
+    end
+    den = y0 - 2 * y1 + y2
+    den >= 0 && return y1                       # not a proper interior peak
+    t = 0.5 * (y0 - y2) / den                   # vertex offset, in node units
+    (!isfinite(t) || abs(t) > 1.0) && return y1
+    ypk = y1 - (y2 - y0)^2 / (8 * den)          # >= y1 because den < 0
+    return (isfinite(ypk) && ypk >= y1) ? ypk : y1
+end
+
+# ---------------------------------------------------------------------------
+# v8 rev A1: max of Im omega along the POLYLINE F, not just at its nodes.
+# See the header.  Returns (refined, node_bound, alpha_r of the refined max).
+# refined >= node_bound always, so the bound can only move UP.
+# ---------------------------------------------------------------------------
+const OMEGA_LB_REFINE = true
+const OMEGA_LB_M      = 8       # sub-intervals per F segment
+const OMEGA_LB_BAND   = 1e-5    # also refine node local maxima this close to the max
+
+# Vertex value of the parabola through three points with unequal spacing;
+# y1 when it is not a proper interior maximum.
+function _parabola_peak(x0, x1, x2, y0, y1, y2)
+    hm = x1 - x0;  hp = x2 - x1
+    (hm > 0 && hp > 0) || return y1
+    s0 = (y1 - y0) / hm;  s1 = (y2 - y1) / hp
+    a = (s1 - s0) / (hm + hp)
+    a >= 0 && return y1
+    b = s0 + a * hm
+    t = -b / (2 * a)
+    (!isfinite(t) || abs(t) > max(hm, hp)) && return y1
+    ypk = y1 - b^2 / (4 * a)
+    return (isfinite(ypk) && ypk >= y1) ? ypk : y1
+end
+
+function omegaF_peak_refined(F, omega_F)
+    base = omegaF_peak_imag(omega_F)
+    y = imag.(omega_F)
+    n = length(y)
+    jmax = argmax(y)
+    (!OMEGA_LB_REFINE || n < 3) && return base, base, real(F[jmax])
+    ymax = y[jmax]
+    cand = [j for j in 1:n if y[j] >= ymax - OMEGA_LB_BAND &&
+                              (j == 1 || y[j] >= y[j-1]) && (j == n || y[j] >= y[j+1])]
+    best = base
+    best_r = real(F[jmax])
+    for j in cand
+        pts = ComplexF64[];  ss = Float64[];  s0 = 0.0
+        for seg in max(j - 1, 1):(min(j + 1, n) - 1)
+            a = F[seg];  b = F[seg+1];  Ls = abs(b - a)
+            for m in 0:(OMEGA_LB_M - 1)
+                push!(pts, a + (m / OMEGA_LB_M) * (b - a));  push!(ss, s0 + (m / OMEGA_LB_M) * Ls)
+            end
+            s0 += Ls
+        end
+        push!(pts, F[min(j + 1, n)]);  push!(ss, s0)
+        yv = imag.(ComplexF64.(pmap(couetteflow_temporal_sing_mode, pts)))
+        i = argmax(yv)
+        pk = yv[i]
+        if 1 < i < length(yv)
+            pk = max(pk, _parabola_peak(ss[i-1], ss[i], ss[i+1], yv[i-1], yv[i], yv[i+1]))
+        end
+        if isfinite(pk) && pk > best
+            best = pk
+            best_r = real(pts[i])
+        end
+    end
+    return best, base, best_r
+end
+
+# ---------------------------------------------------------------------------
+# v4.5 ADAPTIVE L CONTROLS
+#
+# TRIGGER.  Not a fixed d_min threshold: the level at which d_min stalls is
+# itself set by the current spacing (base grid -> 0.22, v4.4's grid -> 0.031),
+# so a fixed threshold either fires immediately or never.  Instead: refine
+# when the argmin has stopped moving and d_min has stopped drifting.  That is
+# the signal that the contour has parked and only the grid is holding d_min
+# up.  On the v4.4 run it first becomes true around iteration 295 and stays
+# true for the remaining ~270 iterations.
+#
+# Both halves of that test have to tolerate noise, and a first version that
+# did not was silently useless.  The eigensolver noise on d is delta_d = K/d,
+# so its RELATIVE size K/d^2 GROWS as the pinch closes: at d = 3e-2 it is
+# 0.3 %, at d = 5e-3 it is 10 %.  Hence
+#   - the winner is allowed to jitter by one cell (it flips between the two
+#     points bracketing the tip), not required to be identical; and
+#   - "d_min stopped changing" is a drift-versus-noise test, not a spread
+#     test: compare the two half-window means against the standard error of
+#     their difference.  A fixed 1 % spread test stops firing near d = 5e-3
+#     and switches the adaptivity off exactly when one more round is still
+#     wanted.  Simulated against the measured noise, the fixed test died at
+#     level 4 (d = 5.9e-3); this one reaches level 7 (d = 2.2e-3).
+#
+# ACTION.  Subdivide the ADAPT_HALF_CELLS cells either side of the winner by
+# ADAPT_FACTOR.  The tip of the V is bracketed by the winner's two immediate
+# neighbours (d is monotone on each side of it), so +-2 cells contains it with
+# margin against noise.  Cost: (2*ADAPT_HALF_CELLS)*(ADAPT_FACTOR-1) = 12 new
+# points per round, and one extra contour_alpha_L_conti to rebuild the
+# branches on the new grid.
+#
+# STOPPING.  Four independent guards, whichever bites first:
+#   ADAPT_D_FLOOR      d_branch is already at the noise floor
+#   ADAPT_MIN_GAIN     a round failed to buy anything, ADAPT_NOGAIN_MAX times
+#                      in a row -- the grid is no longer the limiter and the
+#                      omega_i error (i.e. F's resolution) has taken over
+#   ADAPT_MAX_POINTS   point budget
+#   ADAPT_MIN_H        spacing floor
+# The no-gain rule needs TWO consecutive failures, not one: a single round can
+# land the new points badly and gain nothing purely by luck.  In simulation
+# level 3 gained 0.4 % and level 4 then gained a factor 6, so a one-strike
+# rule would have stopped at d = 2.7e-2, i.e. no better than v4.4.
+# ---------------------------------------------------------------------------
+const ADAPT_ON           = true
+const ADAPT_FACTOR       = 4        # spacing divided by this per round
+const ADAPT_HALF_CELLS   = 2        # subdivide omega_r[i-2 .. i+2]
+const ADAPT_STALL_WINDOW = 20       # iterations the argmin must hold still
+const ADAPT_STALL_TOL    = 1e-2     # relative drift of d_min allowed on top of noise
+# v4.6: was 10.  With the score gate a round taken during the descent is no
+# longer counted as a failure, but it IS still a level, so the descent can now
+# spend levels that v4.5 never reached.  20 levels x 5 nodes = 200 points, well
+# inside ADAPT_MAX_POINTS; ADAPT_MIN_H and ADAPT_D_FLOOR remain the real stops.
+const ADAPT_MAX_LEVEL    = 20
+const ADAPT_MAX_POINTS   = 400
+const ADAPT_MIN_H        = 1e-11
+const ADAPT_MIN_GAIN     = 0.90     # d_after/d_before above this counts as no gain
+const ADAPT_NOGAIN_MAX   = 2        # consecutive no-gain rounds before giving up
+# Below this d_branch, refining resolves eigensolver noise rather than the
+# pinch: the v4.4 residual is white with delta_d = K/d, K = 2.56e-6, so
+# signal = noise at d = 1.6e-3.
+const ADAPT_D_FLOOR      = 2.0e-3
+
+# ---------------------------------------------------------------------------
+# v4.6 CHANGE 1 (the one that unblocks the run) and CHANGE 4.
+#
+# WHAT WENT WRONG IN v4.5.  The adaptive grid fired exactly twice, at k = 193
+# and k = 227, and then switched itself off for the remaining 1774 iterations.
+# The cause is the no-gain rule being applied at a moment when its answer was
+# predetermined.  d_min has two independent causes,
+#
+#     d = 2 sqrt( 2 |Delta omega_r + i Delta omega_i| / |omega''| )
+#
+# and refining omega_r can only ever remove the first.  At both refinements
+# omega_i was still 1.2e-3 ABOVE the pinch while the omega_r miss was ~1e-4,
+# so d was pinned by the vertical offset.  Since
+#
+#     d(omega_r) >= 2 sqrt( 2 |omega_i - Im omega_p| / |omega''| ) = d_floor
+#
+# the achievable gain was capped at d_floor/d_branch = 0.9296 (k = 193) and
+# 0.9517 (k = 227) BEFORE any refinement ran.  Both exceed ADAPT_MIN_GAIN =
+# 0.90, so both rounds were scored as failures no matter what the grid did,
+# adapt_nogain hit ADAPT_NOGAIN_MAX, and adapt_done was set -- permanently,
+# there is no re-enable path.  The stall detector itself was fine: replayed
+# against the recorded history it would have fired at k = 248 and 1607 times
+# afterwards, with the winner index steady at 70 in 100 % of 20-iteration
+# windows after k = 250.  It simply was never called again.
+#
+# CHANGE 1 -- SCORE GATE.  Before the no-gain counter is touched, ask how much
+# of the current d_branch the horizontal miss actually explains.  Near the
+# pinch
+#
+#     d(omega_r)^4 = (64/|omega''|^2) [ (omega_r - omega_pr)^2
+#                                     + (omega_i - omega_pi)^2 ]
+#
+# so d^4 is an exact parabola in omega_r at leading order, and its vertex gives
+# omega_pr without any knowledge of the vertical offset (which only shifts the
+# parabola up).  With
+#
+#     miss    = |omega_r[i_pinch] - omega_pr_fit|
+#     d_horiz = 2 sqrt(2 miss / |omega''|_fit)
+#
+# the ratio d_horiz/d_branch is the share of d the grid is responsible for.
+# On the v4.5 frames: 0.47 (k = 192), 0.66 (k = 226), 0.81 (k = 300), then
+# 0.97-0.99 from k = 700 on, and 0.04 on an omega_i overshoot frame.  A round
+# below ADAPT_GRID_SHARE carries no information about the grid and is not
+# scored -- neither killing round would have counted, adapt_nogain stays 0, and
+# the run keeps refining.
+#
+# Failure direction is safe: a failed fit gives grid_limited = false, the round
+# is not scored, and adaptivity can only stay alive LONGER.  The level cap, the
+# point budget and ADAPT_D_FLOOR still bound the run.
+#
+# CHANGE 4 -- VERTEX PLACEMENT.  The same fit locates omega_pr far better than
+# the grid does, so put the new nodes there instead of subdividing blindly.
+# On the v4.5 frames (n = 2, h = 3.16e-4, 1006 quiet frames):
+#
+#     grid argmin  - Re(omega_p) :  -3.80e-5      (fixed, it is the grid)
+#     fitted vertex - Re(omega_p) :  -7.18e-7 mean, 1.55e-7 s.d.
+#
+# a factor 53 in the miss, i.e. a factor 7 in d, in a SINGLE round against the
+# factor 2 per round that subdivision buys.  The residual is a systematic
+# stencil bias, not noise (mean/s.d. ~ 5, and it grows monotonically with the
+# stencil: -0.72, -1.48, -2.50, -3.77 e-6 for n = 2..5), so it shrinks as the
+# cluster tightens.
+#
+# The noise floor on the vertex is width-independent: an antisymmetric
+# perturbation of size 4 d^2 K (from sigma_d = K/d) on a parabola of curvature
+# 64/|omega''|^2 shifts the vertex by ~ K |omega''| / 4 = 2.7e-7, matching the
+# observed 1.6e-7 s.d.  So the fit cannot locate omega_pr better than ~3e-7,
+# which corresponds to d ~ 2.4e-3 -- the same place sqrt(K) = 1.6e-3 puts the
+# wall.  Expect this run to converge to d ~ 2-4e-3 in two or three rounds and
+# then genuinely stop; that is the float64 limit, not a tuning failure.
+#
+# NOT DONE HERE, deliberately: zeta ~ d^2/2, the non-uniform alpha_i_rr, and
+# the 15-point rolling filter.  They start to matter below d ~ 3e-3.  A
+# non-uniform L grid is safe for the omega update: omega_i_vectorization is
+# constant, so the d_d_omega_r_Phi_L central difference -- the only place
+# omega_r spacing enters -- is identically zero.
+# ---------------------------------------------------------------------------
+const ADAPT_SCORE_GATE   = true     # false -> v4.5 no-gain bookkeeping
+const ADAPT_VERTEX_PLACE = true     # false -> v4.5 refine_omega_r subdivision
+const ADAPT_FIT_HALF     = 2        # points either side of the argmin in the d^4 fit
+const ADAPT_GRID_SHARE   = 0.90     # horizontal miss must explain this much of d
+const ADAPT_CLUSTER_HALF = 2        # 2*this+1 nodes inserted around the vertex
+const ADAPT_VERTEX_MAXMOVE = 2.0    # reject a vertex further than this * h_local
+
+# v4.7 CHANGE 6 (fixing a v4.6 bug of mine).  grid_share had a lower bound only.
+# Once the vertical offset dominates, the varying part of d^4 across the stencil
+# is a couple of per cent of the constant part, the fitted curvature is then
+# dominated by noise and collapses, and grid_share comes out at 200-400 --
+# which sails past a ">= 0.90" test and reads as "definitely grid-limited".
+# On the v4.6 run |omega''|_fit had a median of 0.19 against the true 0.4294
+# after k = 412, and grid_share exceeded 1.5 on 48 of 156 iterations.  A share
+# far above 1 is a broken fit, not a strong signal: bound it on both sides.
+# The degeneracy is itself informative -- the fit falling apart is the run
+# telling you the grid has stopped being the limiter.
+const ADAPT_GRID_SHARE_MAX = 1.50
+
+# v4.7 CHANGE 7: measure "the winner has parked" in omega_r against the local
+# cell width, instead of in grid-index units.  See adapt_stalled().
+const ADAPT_STALL_BY_OMEGA = true
+const ADAPT_WINDOW_CELLS   = 2.0    # how far the winning omega_r may wander
+
+# v4.4 used 1e-4, which is under the double-precision floor above and so could
+# never fire.  v4.5 used 3e-3, just clear of it.
+#
+# v4.6: 5e-4, i.e. deliberately unreachable.  The point of this run is to see
+# WHERE it plateaus, and 3e-3 would stop it exactly in the interesting band --
+# and could stop it spuriously, since at d = 2e-3 the jitter K/d is 1.3e-3, so
+# a single frame can dip through a 3e-3 threshold by luck alone.  Raise this
+# back to ~2e-3 once the plateau is known and you want the run to terminate on
+# success.
+const PINCH_TOL          = 5.0e-4
+
+# v7.2: stop as soon as a tracked branch point is on the wrong side of F, or
+# within SIDE_TOL of it (vertical distance in the alpha plane).  See
+# side_check().  0.0 -> stop on touching or crossing.
+const SIDE_STOP          = true
+const SIDE_TOL           = 0.0
+# rev B STEP 0: the omega-stage check only reports.  The run stops when the
+# branches are on the wrong side of F AFTER the F step for this many
+# consecutive iterations (1 = the first time it happens).
+const SIDE_STOP_RUN      = 1
+global side_run          = 0
+
+# rev B STEP 1: non-uniform F grid.
+const F_UNIFORM_RTOL     = 1e-9     # cells equal to this -> original stencils
+const SIGMA_CFL          = 0.4      # explicit-diffusion cap: sigma dt <= this * h+ h-
+
+# rev B STEP 2: graded F around the throat (v6.1 rule, v6.3 trigger = guard).
+const F_REGRID           = true     # false -> F stays at its 100 uniform nodes
+const F_H_FRAC           = 0.25     # target spacing at the throat, as a share of d
+const F_FINE             = 20       # new nodes either side of the throat at h0
+const F_RATIO            = 1.3      # growth of the spacing outside that block
+const F_HOLD             = 10       # iterations the trigger must hold
+const REGRID_GAIN        = 0.9      # regrid only if the throat spacing improves by this
+const F_MAX_POINTS       = 400      # node budget for F
+global f_coarse_run      = 0
+global f_regrid_count    = 0
+
+global adapt_level  = 0
+global adapt_nogain = 0
+global adapt_done   = false
+global adapt_hist_i = Int[]
+global adapt_hist_d = Float64[]
+global adapt_hist_w = Float64[]   # v4.7: the WINNING omega_r, not just its index
+global adapt_hist_h = Float64[]   # v4.7: h_local at that moment
+
+function adapt_push!(i, d, w, h)
+    push!(adapt_hist_i, i)
+    push!(adapt_hist_d, d)
+    push!(adapt_hist_w, w)
+    push!(adapt_hist_h, h)
+    while length(adapt_hist_i) > ADAPT_STALL_WINDOW
+        popfirst!(adapt_hist_i)
+        popfirst!(adapt_hist_d)
+        popfirst!(adapt_hist_w)
+        popfirst!(adapt_hist_h)
+    end
+    return nothing
+end
+
+function adapt_reset_history!()
+    empty!(adapt_hist_i)
+    empty!(adapt_hist_d)
+    empty!(adapt_hist_w)
+    empty!(adapt_hist_h)
+    return nothing
+end
+
+# True when the argmin has parked AND d_min's drift is inside the noise.
+# The history is cleared on every refinement, so the entries in a window are
+# always comparable (omega_r cannot change inside one).
+#
+# v4.7 CHANGE 7: the "has it parked" test is now in omega_r, not in index.
+# v4.6 required the winning INDEX to hold within +-1.  That is the same thing
+# as +-1 cell on a uniform grid, but once vertex placement has packed a dozen
+# nodes inside one old cell the winner hops several indices while barely
+# moving in omega_r -- and the test then can never pass.  That is what froze
+# the v4.6 run at level 6 (winner spread 6 to 9 indices over every 20-iteration
+# window after k = 420).  Measuring the same thing in omega_r, against the
+# local cell width, is index-count-independent and reduces to the old test on
+# a uniform grid.  Set ADAPT_STALL_BY_OMEGA = false for v4.6 behaviour.
+function adapt_stalled()
+    n = length(adapt_hist_d)
+    n < ADAPT_STALL_WINDOW && return false
+    if ADAPT_STALL_BY_OMEGA
+        href = minimum(adapt_hist_h)
+        (isfinite(href) && href > 0) || return false
+        (maximum(adapt_hist_w) - minimum(adapt_hist_w)) > ADAPT_WINDOW_CELLS * href && return false
+    else
+        # the winner may flip between the two points bracketing the tip
+        (maximum(adapt_hist_i) - minimum(adapt_hist_i)) > 1 && return false
+    end
+    m = abs(mean(adapt_hist_d))
+    m <= 0.0 && return false
+    h = n ÷ 2
+    drift = abs(mean(adapt_hist_d[(h + 1):end]) - mean(adapt_hist_d[1:h]))
+    noise = 2.0 * std(adapt_hist_d) / sqrt(n)   # s.e. of the half-mean difference
+    return drift <= ADAPT_STALL_TOL * m + noise
+end
+
+# Local cell width at index i (the smaller of the two neighbouring cells).
+function local_h(wr, i)
+    n = length(wr)
+    n < 2 && return Inf
+    if i == 1
+        return wr[2] - wr[1]
+    elseif i == n
+        return wr[n] - wr[n-1]
+    end
+    return min(wr[i+1] - wr[i], wr[i] - wr[i-1])
+end
+
+# Subdivide the cells [i-half, i+half] by `factor`.  Everything outside is
+# untouched, so the grid stays sorted and strictly increasing.
+function refine_omega_r(wr, i; factor = ADAPT_FACTOR, half = ADAPT_HALF_CELLS)
+    n = length(wr)
+    lo = max(1, i - half)
+    hi = min(n, i + half)
+    hi <= lo && return copy(wr)
+    out = Float64[]
+    append!(out, wr[1:(lo - 1)])
+    for c in lo:(hi - 1)
+        seg = collect(range(wr[c], wr[c + 1], length = factor + 1))
+        append!(out, seg[1:(end - 1)])   # right endpoint comes from the next cell
+    end
+    push!(out, wr[hi])
+    append!(out, wr[(hi + 1):n])
+    @assert issorted(out)
+    @assert minimum(diff(out)) > 0
+    return out
+end
+
+# Least-squares slope of y on x.
+function _slope(x, y)
+    n = length(x)
+    n < 2 && return NaN
+    mx = mean(x); my = mean(y)
+    sxx = sum((x .- mx) .^ 2)
+    sxx <= 0 && return NaN
+    return sum((x .- mx) .* (y .- my)) / sxx
+end
+
+# Diagnostic only, never used to place points.  Near a pinch
+# d^2 = (8/|omega''|) |omega_r - omega_r_p|, so the slope of d^2 against
+# omega_r on either arm gives |omega''|.  On the v4.4 data this returns 0.477
+# against the true 0.429 (11 % high) -- fine as a sanity number, and the
+# reason the vertex is NOT extrapolated: the same fit locates the tip only
+# 1.8x better than the grid already does, because the cubic term bends the
+# arms.  Bracket and subdivide instead.
+function omega2_estimate(wr, d, i; n = 4)
+    lo = max(firstindex(d), i - n)
+    hi = min(lastindex(d), i + n)
+    (i - lo < 2 || hi - i < 2) && return NaN
+    sl = _slope(wr[lo:i], d[lo:i] .^ 2)
+    sr = _slope(wr[i:hi], d[i:hi] .^ 2)
+    (isnan(sl) || isnan(sr)) && return NaN
+    s = 0.5 * (abs(sl) + abs(sr))
+    return s > 0 ? 8.0 / s : NaN
+end
+
+# Predicted reachable d for a half-cell miss on a grid of spacing h.
+adapt_predicted_d(h, w2) = (isnan(w2) || w2 <= 0) ? NaN : 2 * sqrt(2 * (h / 2) / w2)
+
+# ---------------------------------------------------------------------------
+# v4.6: locate the pinch in omega_r from the shape of the V.
+#
+# Near the pinch  d^4 = (64/|omega''|^2) [ (omega_r - omega_pr)^2 + v^2 ]  with
+# v = omega_i - Im(omega_p).  So d^4 is a parabola in omega_r whose vertex is
+# omega_pr and whose curvature is 64/|omega''|^2; v only shifts it upward and
+# drops out of both.  Returns (omega_pr, |omega''|), or (NaN, NaN) if the fit
+# is not usable.
+#
+# This is NOT omega2_estimate.  That fits d^2 linearly along each arm, where
+# the |.| kink and the cubic term cost it 11 % on |omega''| -- the reason v4.5
+# kept it diagnostic and refused to extrapolate the vertex.  The d^4 form has
+# neither problem: on the v4.5 data it returns |omega''| = 0.4295 against the
+# true 0.42941 (0.02 %) and the vertex to 7.2e-7 mean / 1.6e-7 s.d. over 1006
+# frames, against the grid argmin's fixed 3.8e-5.
+# ---------------------------------------------------------------------------
+function pinch_fit(wr, d, i; n = ADAPT_FIT_HALF)
+    lo = max(firstindex(d), i - n)
+    hi = min(lastindex(d), i + n)
+    (i - lo < 2 || hi - i < 2) && return (NaN, NaN)
+    x = wr[lo:hi] .- wr[i]
+    y = d[lo:hi] .^ 4
+    (all(isfinite, x) && all(isfinite, y)) || return (NaN, NaN)
+    xs = maximum(abs, x)
+    ys = maximum(abs, y)
+    (isfinite(xs) && isfinite(ys) && xs > 0 && ys > 0) || return (NaN, NaN)
+    u = x ./ xs                       # both O(1), so the Vandermonde stays tame
+    z = y ./ ys
+    c = hcat(u .^ 2, u, ones(length(u))) \ z
+    (all(isfinite, c) && c[1] > 0) || return (NaN, NaN)
+    w_pr = wr[i] - xs * c[2] / (2 * c[1])
+    curv = ys * c[1] / xs^2           # = 64 / |omega''|^2
+    return (w_pr, curv > 0 ? 8.0 / sqrt(curv) : NaN)
+end
+
+# Insert 2m+1 nodes of spacing h centred on w_c, keeping every existing node.
+# New nodes outside the grid, or within h/8 of a node already present, are
+# dropped.  Returns a sorted, strictly increasing grid.
+function insert_cluster(wr, w_c, h; m = ADAPT_CLUSTER_HALF)
+    (isfinite(w_c) && isfinite(h) && h > 0) || return copy(wr)
+    (w_c <= wr[1] || w_c >= wr[end]) && return copy(wr)
+    out = collect(wr)
+    for j in -m:m
+        w = w_c + j * h
+        (w <= wr[1] || w >= wr[end]) && continue
+        minimum(abs.(out .- w)) < h / 8 && continue
+        push!(out, w)
+    end
+    sort!(out)
+    @assert issorted(out)
+    @assert minimum(diff(out)) > 0
+    return out
+end
+
+# ---------------------------------------------------------------------------
+# v4.7 CHANGE 8:  full-state checkpoint / resume.
+#
+# WHY.  The v4.5 resume block restored the GEOMETRY -- L, F, the two branches,
+# the adapted grid -- and nothing else.  That was complete for v4.5, where
+# every control constant was frozen for the whole run.  It is NOT complete for
+# v4.7, because CHANGE 5 made zeta_alpha a STATE VARIABLE.  A resume that
+# leaves it out restarts the continuation at ZETA_REF = 4e-4.  From a segment
+# that ended at zeta_alpha = 2.3e-5 that is a 17.7x jump, held for
+# ZETA_WINDOW = 25 iterations while the median window refills (zeta_step
+# returns its argument unchanged until then), and only then walked back down at
+# ZETA_RATE = 3 %/iteration -- ln(17.7)/ln(1.03) ~ 97 iterations more.  So
+# about 120 iterations of every resumed segment would run at the wrong
+# repulsion strength with exp_arg 17.7x too large: straight back into the
+# EXP_ARG_MAX clipping that CHANGE 5 exists to remove.  adapt_done,
+# adapt_nogain and the stall history were dropped as well, so a run that had
+# already retired the refinement would silently switch it back on.
+#
+# WHAT IS SAVED.  Everything the iteration carries across k, stored as the
+# PRIMITIVES rather than the derived arrays so the two cannot disagree:
+#
+#     omega_i, omega_r          ->  L = contour_L()
+#     alpha_i                   ->  F = contour_F()
+#     alpha_L_u, alpha_L_l          (a full re-track if lost)
+#     omega_F                       (a pmap if lost)
+#     zeta_alpha, zeta_hist_d       CHANGE 5 state
+#     adapt_level, adapt_nogain, adapt_done, adapt_hist_{i,d,w,h}
+#     delta_t
+#
+# WHERE.  A separate small file, rewritten in full every iteration.  NOT the
+# JSON log: that log is a diagnostic record, it was 19 MB at k = 567 on v4.6,
+# and its entries are written BEFORE the adaptive refinement block, so the last
+# entry always describes the PRE-refinement grid.  The checkpoint is written at
+# the very END of the iteration, so it describes the state the next iteration
+# actually starts from, refinement included.
+#
+# WHEN THE TWO DISAGREE.  The log entry for iteration j is written before the
+# checkpoint that says "next is j+1", so a kill in between leaves the log one
+# entry ahead of the state.  On resume the log is truncated back to agree with
+# the checkpoint and the original is kept once as <log>.pretruncate.
+#
+# NOTHING HERE KNOWS WHERE THE PINCH IS.  It stores and restores values the run
+# produced, and compares constants against this same source file.
+# ---------------------------------------------------------------------------
+const CKPT_FILE     = "checkpoint_v8.json"
+const CKPT_VERSION  = "v8-ckpt-1"
+const CKPT_EVERY    = 1        # write a checkpoint every N steps; 0 disables
+
+# RESUME = true   ->  continue an existing run if a checkpoint (or, failing
+#                     that, a log) is there.  This is the default: a run that
+#                     stopped at 500 picks up at 501 on the next launch.
+# RESUME = false  ->  start from scratch.  The existing log and checkpoint are
+#                     MOVED ASIDE to .bak1/.bak2/... rather than overwritten.
+# v8 rev A: false for the first rev-A run, so the k = 6 log of the old code
+# (no checkpoint, corrupted frame 6) is moved to .bak1 instead of resumed.
+# Set back to true to continue this run past MAX_STEPS in a later launch.
+const RESUME        = false
+# Refuse to resume across a change to any constant in ckpt_constants().  A
+# continuation under different numerics is a different experiment and must not
+# be written into one log as if it were not.
+const RESUME_STRICT = true
+
+# Absolute stopping point, counted in the JSON "iteration" field, NOT in k.
+# Segment a run by raising this between launches: 500, then 1000, then 1500.
+# MAX_STEPS is only a safety bound on how many steps ONE process will take.
+const ITER_TARGET = 1000
+const MAX_STEPS   = 500
+
+# v7 run control.  The log is one JSON array that is READ, PARSED, APPENDED TO
+# and REWRITTEN every iteration, so its cost is O(k^2) and at k = 3000 the JSON
+# serialisation, not the eigensolves, would dominate the run.  Writing every
+# LOG_EVERY-th frame keeps 300 frames -- plenty to plot -- and costs 1/100 of
+# the I/O.  The CHECKPOINT is still written every step (CKPT_EVERY = 1), so a
+# crash still costs at most one iteration of state.  Set LOG_EVERY = 1 to get
+# v4.7's behaviour back.
+# v7.1: the log is now append-only JSONL (see read_log / append_log below), so
+# a save costs one line regardless of k and every frame can be kept.
+const LOG_EVERY   = 1
+
+# ---------------------------------------------------------------------------
+# Constants that define WHAT IS BEING COMPUTED.  Run control (ITER_TARGET,
+# MAX_STEPS, file names, CKPT_EVERY) is deliberately NOT in here -- those are
+# meant to change from segment to segment.
+# ---------------------------------------------------------------------------
+function ckpt_constants()
+    return Dict{String,Any}(
+        "ZETA_ADAPTIVE"        => ZETA_ADAPTIVE,
+        "ZETA_REF"             => ZETA_REF,
+        "ZETA_D_REF"           => ZETA_D_REF,
+        "ZETA_MIN"             => ZETA_MIN,
+        "ZETA_RATE"            => ZETA_RATE,
+        "ZETA_WINDOW"          => ZETA_WINDOW,
+        "OMEGA_BISECT"         => OMEGA_BISECT,
+        "OMEGA_GAP_TARGET"     => OMEGA_GAP_TARGET,
+        "OMEGA_BISECT_ENGAGE"  => OMEGA_BISECT_ENGAGE,
+        "OMEGA_BISECT_MAX"     => OMEGA_BISECT_MAX,
+        "OMEGA_BISECT_TOL"     => OMEGA_BISECT_TOL,
+        "OMEGA_BISECT_MIN_DFC" => OMEGA_BISECT_MIN_DFC,
+        "OMEGA_LB_PARABOLIC"   => OMEGA_LB_PARABOLIC,
+        "OMEGA_LB_REFINE"      => OMEGA_LB_REFINE,
+        "OMEGA_LB_M"           => OMEGA_LB_M,
+        "OMEGA_LB_BAND"        => OMEGA_LB_BAND,
+        "CLOUD_SIDE_TEST"      => string(CLOUD_SIDE_TEST),
+        "ADAPT_ON"             => ADAPT_ON,
+        "ADAPT_FACTOR"         => ADAPT_FACTOR,
+        "ADAPT_HALF_CELLS"     => ADAPT_HALF_CELLS,
+        "ADAPT_STALL_WINDOW"   => ADAPT_STALL_WINDOW,
+        "ADAPT_STALL_TOL"      => ADAPT_STALL_TOL,
+        "ADAPT_MAX_LEVEL"      => ADAPT_MAX_LEVEL,
+        "ADAPT_MAX_POINTS"     => ADAPT_MAX_POINTS,
+        "ADAPT_MIN_H"          => ADAPT_MIN_H,
+        "ADAPT_MIN_GAIN"       => ADAPT_MIN_GAIN,
+        "ADAPT_NOGAIN_MAX"     => ADAPT_NOGAIN_MAX,
+        "ADAPT_D_FLOOR"        => ADAPT_D_FLOOR,
+        "ADAPT_SCORE_GATE"     => ADAPT_SCORE_GATE,
+        "ADAPT_VERTEX_PLACE"   => ADAPT_VERTEX_PLACE,
+        "ADAPT_FIT_HALF"       => ADAPT_FIT_HALF,
+        "ADAPT_GRID_SHARE"     => ADAPT_GRID_SHARE,
+        "ADAPT_GRID_SHARE_MAX" => ADAPT_GRID_SHARE_MAX,
+        "ADAPT_CLUSTER_HALF"   => ADAPT_CLUSTER_HALF,
+        "ADAPT_VERTEX_MAXMOVE" => ADAPT_VERTEX_MAXMOVE,
+        "ADAPT_STALL_BY_OMEGA" => ADAPT_STALL_BY_OMEGA,
+        "ADAPT_WINDOW_CELLS"   => ADAPT_WINDOW_CELLS,
+        "PINCH_TOL"            => PINCH_TOL,
+        "SIDE_STOP"            => SIDE_STOP,
+        "SIDE_TOL"             => SIDE_TOL,
+        "SIDE_STOP_RUN"        => SIDE_STOP_RUN,
+        "F_UNIFORM_RTOL"       => F_UNIFORM_RTOL,
+        "SIGMA_CFL"            => SIGMA_CFL,
+        "F_REGRID"             => F_REGRID,
+        "F_H_FRAC"             => F_H_FRAC,
+        "F_FINE"               => F_FINE,
+        "F_RATIO"              => F_RATIO,
+        "F_HOLD"               => F_HOLD,
+        "REGRID_GAIN"          => REGRID_GAIN,
+        "F_MAX_POINTS"         => F_MAX_POINTS,
+        "EXP_ARG_MAX"          => EXP_ARG_MAX,
+        "TRACK_SIDE_SLACK"     => TRACK_SIDE_SLACK,
+        "TRACK_MIN_STEP"       => TRACK_MIN_STEP,
+        # v8 point cloud
+        "CLOUD_ABS_MAX"        => CLOUD_ABS_MAX,
+        "CLOUD_DIST_MAX"       => CLOUD_DIST_MAX,
+        "CLOUD_NBINS"          => CLOUD_NBINS,
+        "CLOUD_WIN"            => CLOUD_WIN,
+        "CLOUD_SPIKE_REL"      => CLOUD_SPIKE_REL,
+        "CLOUD_SMOOTH"         => CLOUD_SMOOTH,
+        "CLOUD_S_PAD"          => CLOUD_S_PAD,
+        "CLOUD_COORD"          => string(CLOUD_COORD),
+        "num_modes"            => num_modes,
+        "N"                    => N,
+        "s_omega"              => s_omega,
+        "s_alpha"              => s_alpha,
+        "epsilon"              => epsilon,
+        "lambda"               => lambda,
+        "sigma"                => sigma,
+    )
+end
+
+function ckpt_constants_diff(stored)
+    now = ckpt_constants()
+    diffs = String[]
+    for key in sort(collect(keys(now)))
+        if !haskey(stored, key)
+            push!(diffs, string(key, ": absent from the checkpoint, now ", now[key]))
+            continue
+        end
+        a = stored[key]
+        b = now[key]
+        same = (a isa Number && b isa Number) ? (Float64(a) == Float64(b)) : (a == b)
+        same || push!(diffs, string(key, ": checkpoint ", a, "  ->  now ", b))
+    end
+    return diffs
+end
+
+# ---------------------------------------------------------------------------
+# open(path, "w") TRUNCATES FIRST and only then spends seconds writing tens of
+# MB.  A kill inside that window destroys the whole run history -- which is
+# exactly what a resume mechanism must not depend on.  Write to a temporary
+# file and rename instead, so the failure window is the rename, not the write.
+# ---------------------------------------------------------------------------
+function atomic_write(path, str; tries = 5)
+    tmp = path * ".tmp"
+    open(tmp, "w") do io
+        write(io, str)
+    end
+    # On Windows the rename has to delete the target first, and that fails if
+    # anything else holds the file open -- an editor, a plotting script, a
+    # virus scanner.  Losing a 10-hour run to a transient lock is not
+    # acceptable, so retry, and fall back to a direct write rather than throw.
+    for attempt in 1:tries
+        try
+            mv(tmp, path; force = true)
+            return nothing
+        catch err
+            if attempt == tries
+                @printf("[io] rename onto %s failed %d times (%s); writing in place instead\n",
+                        path, tries, sprint(showerror, err))
+                flush(stdout)
+                open(path, "w") do io
+                    write(io, str)
+                end
+                try
+                    rm(tmp; force = true)
+                catch
+                end
+                return nothing
+            end
+            sleep(0.2 * attempt)
+        end
+    end
+    return nothing
+end
+
+function ckpt_state_ok()
+    isfinite(omega_i)    || return false, "omega_i"
+    isfinite(zeta_alpha) || return false, "zeta_alpha"
+    isfinite(delta_t)    || return false, "delta_t"
+    all(isfinite, omega_r)   || return false, "omega_r"
+    all(isfinite, alpha_i)   || return false, "alpha_i"
+    all(isfinite, alpha_r)   || return false, "alpha_r"
+    length(alpha_r) == length(alpha_i) || return false, "alpha_r/alpha_i length"
+    all(isfinite, alpha_L_u) || return false, "alpha_L_u"
+    all(isfinite, alpha_L_l) || return false, "alpha_L_l"
+    all(isfinite, pair_u)    || return false, "pair_u"
+    all(isfinite, pair_l)    || return false, "pair_l"
+    (length(pair_u) == length(omega_r) && length(pair_l) == length(omega_r)) ||
+        return false, "pair_u/pair_l length vs omega_r"
+    all(isfinite, omega_F)   || return false, "omega_F"
+    return true, ""
+end
+
+function write_checkpoint!()
+    ok, bad = ckpt_state_ok()
+    if !ok
+        @printf("[ckpt] NOT written before iteration %d: %s holds non-finite values; the previous checkpoint stands\n",
+                iteration_step, bad)
+        flush(stdout)
+        return false
+    end
+    # JSON.jl does not round-trip NaN/Inf, and the four adapt_hist arrays have
+    # to stay index-aligned, so if any one of them is polluted the whole window
+    # is dropped.  That costs ADAPT_STALL_WINDOW iterations of stall detection
+    # -- exactly what every refinement already costs via adapt_reset_history!.
+    hist_ok = all(isfinite, adapt_hist_d) && all(isfinite, adapt_hist_w) &&
+              all(isfinite, adapt_hist_h)
+    ckpt = Dict{String,Any}(
+        "ckpt_version"   => CKPT_VERSION,
+        "written_at"     => Base.Libc.strftime("%Y-%m-%d %H:%M:%S", time()),
+        "next_iteration" => iteration_step,
+        "constants"      => ckpt_constants(),
+        # geometry, as primitives
+        "omega_i"        => omega_i,
+        "omega_r"        => collect(Float64, omega_r),
+        "alpha_i"        => collect(Float64, alpha_i),
+        "alpha_r"        => collect(Float64, alpha_r),      # rev B: F grid can be graded
+        "f_coarse_run"   => f_coarse_run,
+        "f_regrid_count" => f_regrid_count,
+        "side_run"       => side_run,
+        "alpha_L_u"      => complexvec_to_json(alpha_L_u),
+        "alpha_L_l"      => complexvec_to_json(alpha_L_l),
+        # v8: per-omega pairs and frontier source indices
+        "pair_u"         => complexvec_to_json(pair_u),
+        "pair_l"         => complexvec_to_json(pair_l),
+        "front_j_u"      => collect(Int, front_j_u),
+        "front_j_l"      => collect(Int, front_j_l),
+        "pair_fallback"  => pair_fallback,
+        "omega_F"        => complexvec_to_json(omega_F),
+        # v4.7 CHANGE 5 state -- the part the v4.5 resume used to drop
+        "zeta_alpha"     => zeta_alpha,
+        "zeta_hist_d"    => collect(Float64, zeta_hist_d),
+        "delta_t"        => delta_t,
+        # adaptive-refinement state
+        "adapt_level"    => adapt_level,
+        "adapt_nogain"   => adapt_nogain,
+        "adapt_done"     => adapt_done,
+        "adapt_hist_ok"  => hist_ok,
+        "adapt_hist_i"   => hist_ok ? collect(Int, adapt_hist_i)     : Int[],
+        "adapt_hist_d"   => hist_ok ? collect(Float64, adapt_hist_d) : Float64[],
+        "adapt_hist_w"   => hist_ok ? collect(Float64, adapt_hist_w) : Float64[],
+        "adapt_hist_h"   => hist_ok ? collect(Float64, adapt_hist_h) : Float64[],
+    )
+    atomic_write(CKPT_FILE, JSON.json(ckpt))
+    return true
+end
+
+# ---------------------------------------------------------------------------
+# v7.1 LOG I/O.  JSONL: one complete JSON object per line, appended.
+#
+# read_log(path) returns (entries, n_bad).  Unparseable lines (a partial final
+# line from a killed run) are skipped and counted, never fatal.  A path ending
+# in .json is read as the old single-array format, so the helpers below also
+# work on v7 and earlier logs (compare_runs, load_step).
+# ---------------------------------------------------------------------------
+function read_log(path)
+    if lowercase(splitext(path)[2]) == ".json"
+        return Any[e for e in JSON.parse(read(path, String))], 0
+    end
+    entries = Any[]
+    n_bad = 0
+    for line in eachline(path)
+        isempty(strip(line)) && continue
+        e = try
+            JSON.parse(line)
+        catch
+            nothing
+        end
+        if e === nothing
+            n_bad += 1
+        else
+            push!(entries, e)
+        end
+    end
+    return entries, n_bad
+end
+
+log_lines(entries) = isempty(entries) ? "" : join((JSON.json(e) for e in entries), "\n") * "\n"
+
+function append_log(path, d)
+    open(path, "a") do io
+        println(io, JSON.json(d))
+        flush(io)
+    end
+    return nothing
+end
+
+# Drop log entries at or past the checkpoint's next_iteration so the log and
+# the restored state describe the same run.  The original is kept once.
+# v7.1: also drops any unparseable (partial) line, so the next append starts
+# on a clean line.
+function truncate_log_to!(next_iter)
+    if !isfile(filename)
+        # A checkpoint with no log: the loop's read-push-write would throw on
+        # its first save.  Start an empty array so the run can continue; the
+        # history before this point is gone and the operator should know.
+        @printf("!! %s is missing but %s is not.  Starting an EMPTY log -- every entry before iteration %d is lost.\n",
+                filename, CKPT_FILE, next_iter)
+        atomic_write(filename, "")
+        return 0
+    end
+    data, n_bad = read_log(filename)
+    keep = [e for e in data if e["iteration"] < next_iter]
+    dropped = length(data) - length(keep)
+    if n_bad > 0
+        @printf("[log] %d unparseable line(s) in %s (partial write from a killed run) -- removed\n",
+                n_bad, filename)
+        flush(stdout)
+    end
+    if dropped > 0 || n_bad > 0
+        backup = filename * ".pretruncate"
+        isfile(backup) || cp(filename, backup)
+        atomic_write(filename, log_lines(keep))
+    end
+    return dropped
+end
+
+# RESUME = false must not silently delete a finished run.
+function archive_existing!()
+    moved = String[]
+    for p in (filename, CKPT_FILE)
+        isfile(p) || continue
+        n = 1
+        while isfile(string(p, ".bak", n))
+            n += 1
+        end
+        dest = string(p, ".bak", n)
+        mv(p, dest)
+        push!(moved, dest)
+    end
+    return moved
+end
+
+# Iteration stamped "resumed" in the log, so every join is visible in the data
+# rather than having to be remembered.  0 = this process started a fresh run.
+global resume_join_at = 0
+
+begin
+    ckpt = nothing
+    if RESUME && isfile(CKPT_FILE)
+        ckpt = JSON.parse(read(CKPT_FILE, String))
+        diffs = ckpt_constants_diff(get(ckpt, "constants", Dict{String,Any}()))
+        if !isempty(diffs)
+            println()
+            println("!! CHECKPOINT CONSTANTS DIFFER FROM THIS SOURCE FILE:")
+            for d in diffs
+                println("!!     ", d)
+            end
+            if RESUME_STRICT
+                error("Refusing to resume across a constant change -- the continuation " *
+                      "would not be the same run as the segment already in $(filename). " *
+                      "Either restore the constants, set RESUME_STRICT = false if the " *
+                      "hybrid is what you want, or set RESUME = false to start fresh.")
+            else
+                println("!! RESUME_STRICT = false: continuing anyway.  THE SEGMENTS IN")
+                println("!! $(filename) ARE NOT THE SAME EXPERIMENT.")
+                println()
+            end
+        end
+    end
+
+    if ckpt !== nothing
+        # ---------------- full-state resume ----------------
+        global iteration_step = Int(ckpt["next_iteration"])
+        global omega_i   = Float64(ckpt["omega_i"])
+        global omega_r   = Float64[x for x in ckpt["omega_r"]]
+        global alpha_i   = Float64[x for x in ckpt["alpha_i"]]
+        # rev B: older checkpoints have no alpha_r -> the original uniform grid
+        global alpha_r   = haskey(ckpt, "alpha_r") ? Float64[x for x in ckpt["alpha_r"]] :
+                           collect(range(alpha_r_start, alpha_r_end, length = length(alpha_i)))
+        global f_coarse_run   = Int(get(ckpt, "f_coarse_run", 0))
+        global f_regrid_count = Int(get(ckpt, "f_regrid_count", 0))
+        global side_run       = Int(get(ckpt, "side_run", 0))
+        global alpha_L_u = ComplexF64[complex(x["re"], x["im"]) for x in ckpt["alpha_L_u"]]
+        global alpha_L_l = ComplexF64[complex(x["re"], x["im"]) for x in ckpt["alpha_L_l"]]
+        global omega_F   = ComplexF64[complex(x["re"], x["im"]) for x in ckpt["omega_F"]]
+        # v4.7 state
+        global zeta_alpha   = Float64(ckpt["zeta_alpha"])
+        global delta_t      = Float64(ckpt["delta_t"])
+        global adapt_level  = Int(ckpt["adapt_level"])
+        global adapt_nogain = Int(ckpt["adapt_nogain"])
+        global adapt_done   = ckpt["adapt_done"] === true
+        empty!(zeta_hist_d)
+        append!(zeta_hist_d, Float64[x for x in ckpt["zeta_hist_d"]])
+        adapt_reset_history!()
+        if get(ckpt, "adapt_hist_ok", false) === true
+            append!(adapt_hist_i, Int[x     for x in ckpt["adapt_hist_i"]])
+            append!(adapt_hist_d, Float64[x for x in ckpt["adapt_hist_d"]])
+            append!(adapt_hist_w, Float64[x for x in ckpt["adapt_hist_w"]])
+            append!(adapt_hist_h, Float64[x for x in ckpt["adapt_hist_h"]])
+        end
+        # derived from the primitives above, never stored, so they cannot
+        # disagree with them
+        global L = contour_L()
+        global F = contour_F()
+        push_omega_r()
+        load_on_workers()
+        @everywhere begin
+            normals_F = contour_normals(F)
+        end
+        # v8: pairs and frontier tags.  A checkpoint without them (or one
+        # whose pairs do not fit the stored grid) gets one fresh sweep on the
+        # restored L and F instead.
+        if haskey(ckpt, "pair_u") && haskey(ckpt, "pair_l") &&
+           haskey(ckpt, "front_j_u") && haskey(ckpt, "front_j_l") &&
+           length(ckpt["pair_u"]) == length(omega_r)
+            global pair_u    = ComplexF64[complex(x["re"], x["im"]) for x in ckpt["pair_u"]]
+            global pair_l    = ComplexF64[complex(x["re"], x["im"]) for x in ckpt["pair_l"]]
+            global front_j_u = Int[x for x in ckpt["front_j_u"]]
+            global front_j_l = Int[x for x in ckpt["front_j_l"]]
+            global pair_fallback = Int(get(ckpt, "pair_fallback", 0))
+            global cloud_u = ComplexF64[]     # plot only; refilled by the next sweep
+            global cloud_l = ComplexF64[]
+            global track_overrides = 0
+            global track_jump_u = length(alpha_L_u) < 2 ? 0.0 : maximum(abs.(diff(alpha_L_u)))
+            global track_jump_l = length(alpha_L_l) < 2 ? 0.0 : maximum(abs.(diff(alpha_L_l)))
+        else
+            println("!! checkpoint has no usable pair_u/pair_l -- re-sweeping the restored geometry")
+            set_branches!(contour_alpha_L_conti(L))
+        end
+        dropped = truncate_log_to!(iteration_step)
+        global resume_join_at = iteration_step
+        println()
+        println("====================================================================")
+        @printf("RESUMED from %s (written %s)\n", CKPT_FILE, get(ckpt, "written_at", "?"))
+        @printf("  next iteration   : %d   (target %d)\n", iteration_step, ITER_TARGET)
+        @printf("  omega_i          : %.15e\n", omega_i)
+        @printf("  N_L / adapt_level: %d / %d   (adapt_done = %s, nogain = %d)\n",
+                length(omega_r), adapt_level, adapt_done, adapt_nogain)
+        @printf("  zeta_alpha       : %.6e   (median window %d/%d full)\n",
+                zeta_alpha, length(zeta_hist_d), ZETA_WINDOW)
+        @printf("  stall history    : %d/%d entries\n",
+                length(adapt_hist_d), ADAPT_STALL_WINDOW)
+        @printf("  delta_t          : %.6e\n", delta_t)
+        if dropped > 0
+            @printf("  log truncated    : %d entr%s past the checkpoint dropped; original kept as %s.pretruncate\n",
+                    dropped, dropped == 1 ? "y" : "ies", filename)
+        end
+        println("====================================================================")
+        println()
+        flush(stdout)
+
+    elseif RESUME && isfile(filename)
+        # ---------------- legacy geometry-only resume (v4.5 path) ----------------
+        println()
+        println("!! NO $(CKPT_FILE) FOUND -- falling back to the v4.5 log-based resume.")
+        println("!! v4.7 CHANGE 8b: zeta_alpha and the zeta median window ARE now")
+        println("!! recovered from the log below, so the repulsion strength is")
+        println("!! continuous across the join.  What is still lost: the stall")
+        println("!! history (20 iterations of no refinement, the same cost every")
+        println("!! refinement round already pays), adapt_nogain, and adapt_done.")
+        println("!! Use this only to pick up a run started before checkpointing")
+        println("!! existed; every launch after this one will find the checkpoint.")
+        println()
+        resume_array, n_bad_log = read_log(filename)
+        isempty(resume_array) && error("$(filename) has no complete entries to resume from")
+        # v7.1: rewrite without the partial line so the next append is clean
+        n_bad_log > 0 && atomic_write(filename, log_lines(resume_array))
+        resume_entry = resume_array[end]
+        global iteration_step = resume_entry["iteration"] + 1
+        global L         = ComplexF64[complex(x["re"], x["im"]) for x in resume_entry["L"]]
+        global alpha_L_u = ComplexF64[complex(x["re"], x["im"]) for x in resume_entry["alpha_L_u"]]
+        global alpha_L_l = ComplexF64[complex(x["re"], x["im"]) for x in resume_entry["alpha_L_l"]]
+        global F         = ComplexF64[complex(x["re"], x["im"]) for x in resume_entry["F"]]
+        global omega_F   = ComplexF64[complex(x["re"], x["im"]) for x in resume_entry["omega_F"]]
+        global omega_i   = imag(L[1])
+        global alpha_i   = imag.(F)
+        global alpha_r   = real.(F)        # rev B: the logged F carries its own grid
+        # v4.5: the grid IS the stored L, not the constant built at load time.
+        global omega_r      = real.(L)
+        global adapt_level  = get(resume_entry, "adapt_level", 0)
+        global adapt_nogain = 0
+        global adapt_done   = false
+
+        # v4.7 CHANGE 8b: the legacy path was written as if the log carried no
+        # zeta information.  The v4.7 log does -- every entry has zeta_alpha,
+        # and d_branch is the only thing zeta_hist_d is ever fed -- so the
+        # CHANGE 5 state does NOT have to be thrown away here.  Dropping it
+        # cost, resuming the 501-iteration run:
+        #     zeta_alpha 1.0029e-05 -> ZETA_REF 4.0e-04           = 39.9x
+        #     exp_arg    2.75       -> 121 on the first step
+        #     recovery   25 frozen + ln(39.9)/ln(1.03) ~ 125      ~ 150 iters
+        # i.e. 150 iterations back inside the EXP_ARG_MAX clipping CHANGE 5
+        # exists to remove.  With this block, zeta_step has a full window on
+        # the first step and moves 1.0029e-05 -> 9.73e-06 instead.
+        z_log = get(resume_entry, "zeta_alpha", nothing)
+        if z_log isa Real && isfinite(z_log) && z_log > 0
+            global zeta_alpha = float(z_log)
+            @printf("   restored zeta_alpha = %.6e from the log entry\n", zeta_alpha)
+        else
+            @printf("   log entry has no usable zeta_alpha; keeping ZETA_REF = %.3e\n",
+                    ZETA_REF)
+        end
+        empty!(zeta_hist_d)
+        for e_prev in resume_array[max(1, length(resume_array) - ZETA_WINDOW + 1):end]
+            db_prev = get(e_prev, "d_branch", nothing)
+            db_prev isa Real && zeta_push_d!(float(db_prev))
+        end
+        @printf("   restored zeta median window: %d of %d entries%s\n",
+                length(zeta_hist_d), ZETA_WINDOW,
+                length(zeta_hist_d) < ZETA_WINDOW ?
+                    "  (short -- zeta stays frozen until it fills)" : "")
+
+        adapt_reset_history!()
+        push_omega_r()
+        load_on_workers()
+        @everywhere begin
+            normals_F = contour_normals(F)
+        end
+        # v8: pairs, tags and clouds are not all in the log -- rebuild the
+        # whole branch state from one sweep on the restored L and F.
+        set_branches!(contour_alpha_L_conti(L))
+        load_on_workers()
+        global resume_join_at = iteration_step
+        @printf("RESUMED (geometry only) from iteration %d: omega_i = %.9e, N_L = %d, adapt_level = %d, %d entries in %s\n",
+                resume_entry["iteration"], omega_i, length(omega_r), adapt_level,
+                length(resume_array), filename)
+        flush(stdout)
+
+    else
+        # ---------------- fresh run ----------------
+        if isfile(filename) || isfile(CKPT_FILE)
+            moved = archive_existing!()
+            println("RESUME = false: existing run moved aside -> ", join(moved, ", "))
+        end
+        iteration_step = 1
+        dict_to_JSON = Dict(
+            "iteration" => iteration_step,
+            "L" => complexvec_to_json(L),
+            "alpha_L_u" => complexvec_to_json(alpha_L_u),
+            "alpha_L_l" => complexvec_to_json(alpha_L_l),
+            "F" => complexvec_to_json(F),
+            "omega_F" => complexvec_to_json(omega_F),
+            "omega_F_at_L" => complexvec_to_json(omega_F),
+            "omega_gap" => omega_i - maximum(imag.(omega_F)),
+            "omega_bisect_status" => "initial",
+            "omega_bisect_tries" => 0,
+            "d_branch" => nothing,
+            "d_contour" => nothing,
+            # v4.5: the grid varies between entries now, so every entry says
+            # which grid it was computed on.
+            "n_L" => length(L),
+            "adapt_level" => adapt_level,
+            "h_local" => nothing,
+            # v4.7 CHANGE 9b: the seed entry used to carry a SHORTER key list
+            # than every later entry.  MATLAB's jsondecode builds a struct
+            # array only when every object in the array has the same field
+            # NAMES -- one odd entry and it returns a cell array of structs
+            # instead, so every reader doing jsonData(k).field dies on the
+            # first pass.  That is why the v4.5 log animates and the v4.6 and
+            # v4.7 logs do not.  Differing value sizes and nulls are fine; it
+            # is only the names that matter.  Keep these in step with the
+            # per-iteration Dict below.
+            "omega_pr_fit" => nothing,
+            "omega2_fit"   => nothing,
+            "pinch_miss"   => nothing,
+            "grid_share"   => nothing,
+            "zeta_alpha"   => nothing,
+            "zeta_d_med"   => nothing,
+            "exp_arg_max"  => nothing,
+            "dist_u"       => nothing,
+            "dist_l"       => nothing,
+            "track_overrides" => nothing,
+            "track_jump_u"    => nothing,
+            "track_jump_l"    => nothing,
+            # v7.2 / rev B keys, so every entry has the same field names (MATLAB)
+            "side_stage"  => nothing, "side_gap_u" => nothing, "side_gap_l" => nothing,
+            "side_bad_u"  => nothing, "side_bad_l" => nothing, "side_out"   => nothing,
+            "side_hit"    => nothing,
+            "side_om_gap_u" => nothing, "side_om_gap_l" => nothing, "side_om_hit" => nothing,
+            "side_run"    => nothing,
+            "n_F"         => length(F),
+            "h_throat"    => nothing, "throat_r" => nothing, "regrid_gain" => nothing,
+            "f_coarse_run" => nothing, "f_regrid" => nothing, "n_sigma_cap" => nothing,
+            "omega_lb_refined" => nothing, "omega_lb_node" => nothing, "omega_lb_alpha_r" => nothing,
+            # v8 keys (same names in every entry, for MATLAB)
+            "pair_u" => complexvec_to_json(pair_u),
+            "pair_l" => complexvec_to_json(pair_l),
+            "d_branch_front" => nothing,
+            "cloud_n_u" => length(cloud_u), "cloud_n_l" => length(cloud_l),
+            "cloud_u" => complexvec_to_json(cloud_u),
+            "cloud_l" => complexvec_to_json(cloud_l),
+            "front_n_u" => length(alpha_L_u), "front_n_l" => length(alpha_L_l),
+            "pair_fallback" => pair_fallback,
+        )
+        # v7.1: a fresh JSONL file holding the seed line
+        atomic_write(filename, JSON.json(dict_to_JSON) * "\n")
+        iteration_step += 1
+        write_checkpoint!()
+        @printf("FRESH RUN: log %s, checkpoint %s, target iteration %d\n",
+                filename, CKPT_FILE, ITER_TARGET)
+        flush(stdout)
+    end
+end
+
+# v8: SET distance.  The frontiers are not paired by index (different
+# lengths, ordered by s along F), so the v7.2 index-wise minimum is
+# meaningless for them.  For the per-omega pairs use pair_gap (d_vec).
+function branch_distance(alpha_L_u, alpha_L_l)
+    return minimum(abs(a - b) for a in alpha_L_u for b in alpha_L_l)
+end
+
+# v8: |pair_u[j] - pair_l[j]| on L, the gap as a function of omega_r.
+pair_gap(pu, pl) = abs.(pu .- pl)
+
+function contour_L_at(omega_i_trial)
+    return ComplexF64[
+        omega_r[j] + omega_i_trial * im
+        for j in eachindex(omega_r)
+    ]
+end
+
+function branch_overlap_valid(alpha_u, alpha_l; overlap_tol = 1e-8)
+    min_dist = Inf
+    min_i = 0
+    min_j = 0
+    for i in eachindex(alpha_u)
+        for j in eachindex(alpha_l)
+            d = abs(alpha_u[i] - alpha_l[j])
+            if d < min_dist
+                min_dist = d
+                min_i = i
+                min_j = j
+            end
+        end
+    end
+    if min_dist < overlap_tol
+        return false, @sprintf(
+            "upper/lower overlap: d=%.3e at upper[%d], lower[%d]", min_dist, min_i, min_j)
+    end
+    return true, @sprintf("no overlap: min upper/lower distance=%.3e", min_dist)
+end
+
+# ---------------------------------------------------------------------------
+# v7.2: which side of F each tracked branch point is on.
+#
+# F = alpha_r + i alpha_i with alpha_r strictly increasing, so F is a graph
+# and "above F" is exact: gap(e) = Im(e) - F_interp(Re(e)), F linearly
+# interpolated between nodes.  Unlike spatial_payload's nearest-node normal
+# test this does not depend on F's node spacing.
+#
+#   gap_u  min over the upper branch of  gap(e)   (> 0 means above F: good)
+#   gap_l  min over the lower branch of -gap(e)   (> 0 means below F: good)
+#   bad_u / bad_l  number of points with gap <= tol on the wrong side
+#   i_u / i_l      L index of the worst point (0 if none in range)
+#   n_out          points with Re(e) outside F's alpha_r range (no side)
+# ---------------------------------------------------------------------------
+function side_gap(F, e)
+    xF = real.(F)
+    x = real(e)
+    (x < xF[1] || x > xF[end]) && return NaN
+    j = clamp(searchsortedlast(xF, x), 1, length(F) - 1)
+    t = (x - xF[j]) / (xF[j+1] - xF[j])
+    return imag(e) - ((1 - t) * imag(F[j]) + t * imag(F[j+1]))
+end
+
+function side_check(F, alpha_L_u, alpha_L_l; tol = SIDE_TOL)
+    gap_u, i_u, bad_u = Inf, 0, 0
+    gap_l, i_l, bad_l = Inf, 0, 0
+    n_out = 0
+    for j in eachindex(alpha_L_u)
+        g = side_gap(F, alpha_L_u[j])
+        if isnan(g)
+            n_out += 1
+            continue
+        end
+        g <= tol && (bad_u += 1)
+        if g < gap_u
+            gap_u, i_u = g, j
+        end
+    end
+    for j in eachindex(alpha_L_l)
+        g = -side_gap(F, alpha_L_l[j])
+        if isnan(g)
+            n_out += 1
+            continue
+        end
+        g <= tol && (bad_l += 1)
+        if g < gap_l
+            gap_l, i_l = g, j
+        end
+    end
+    return (gap_u = gap_u, i_u = i_u, bad_u = bad_u,
+            gap_l = gap_l, i_l = i_l, bad_l = bad_l, n_out = n_out,
+            hit = bad_u > 0 || bad_l > 0)
+end
+
+# v8: sc.i_u / sc.i_l index the FRONTIER, not L.  The omega shown is that
+# of the L point the frontier vertex came from (front_j_u / front_j_l).
+function side_report(k, stage, sc, L, alpha_L_u, alpha_L_l,
+                     ju = front_j_u, jl = front_j_l)
+    wr(j, jj) = (1 <= j <= length(jj) && 1 <= jj[j] <= length(L)) ? real(L[jj[j]]) : NaN
+    @printf("[k=%d] SIDE (%s): upper %d bad, min gap %.3e%s | lower %d bad, min gap %.3e%s | %d out of F range\n",
+            k, stage,
+            sc.bad_u, sc.gap_u,
+            sc.i_u > 0 ? @sprintf(" at omega_r=%.9f alpha=%.6f%+.6fi", wr(sc.i_u, ju),
+                                  real(alpha_L_u[sc.i_u]), imag(alpha_L_u[sc.i_u])) : "",
+            sc.bad_l, sc.gap_l,
+            sc.i_l > 0 ? @sprintf(" at omega_r=%.9f alpha=%.6f%+.6fi", wr(sc.i_l, jl),
+                                  real(alpha_L_l[sc.i_l]), imag(alpha_L_l[sc.i_l])) : "",
+            sc.n_out)
+    flush(stdout)
+end
+
+# ---------------------------------------------------------------------------
+# rev B STEP 2: graded F.  See the header.  Every existing node is kept and
+# the new ones lie on the current polyline, so F itself does not move.
+# ---------------------------------------------------------------------------
+function f_interp(xs, ys, x)
+    x <= xs[1]   && return ys[1]
+    x >= xs[end] && return ys[end]
+    j = clamp(searchsortedlast(xs, x), 1, length(xs) - 1)
+    t = (x - xs[j]) / (xs[j+1] - xs[j])
+    return (1 - t) * ys[j] + t * ys[j+1]
+end
+
+function f_cell_h(xs, x)
+    j = clamp(searchsortedlast(xs, x), 1, length(xs) - 1)
+    return xs[j+1] - xs[j]
+end
+
+# New alpha_r: old nodes + a graded block around c.  Returns nothing if the
+# block would not make the throat spacing finer by REGRID_GAIN, or if the
+# result would exceed F_MAX_POINTS.
+function graded_alpha_r(xr, c, h0)
+    lo, hi = xr[1], xr[end]
+    (isfinite(c) && lo < c < hi && isfinite(h0) && h0 > 0) || return nothing
+    newx = Float64[c];  newh = Float64[h0]
+    for dir in (1, -1)
+        x = c;  h = h0;  k = 0
+        while true
+            k += 1
+            k > F_FINE && (h *= F_RATIO)
+            x += dir * h
+            (x <= lo || x >= hi) && break
+            h >= f_cell_h(xr, x) && break          # reached the existing spacing
+            push!(newx, x);  push!(newh, h)
+        end
+    end
+    # a new node closer than half its own spacing to an existing node is
+    # dropped -- existing nodes are never moved or removed
+    keep = [minimum(abs.(xr .- newx[i])) >= 0.5 * newh[i] for i in eachindex(newx)]
+    xs = sort!(vcat(collect(Float64, xr), newx[keep]))
+    length(xs) > F_MAX_POINTS && return nothing
+    h_now = local_h(xr, argmin(abs.(xr .- c)))
+    h_new = local_h(xs, argmin(abs.(xs .- c)))
+    (isfinite(h_new) && h_new < REGRID_GAIN * h_now) || return nothing
+    return xs
+end
+
+function regrid_F!(c, d)
+    xs = graded_alpha_r(alpha_r, c, F_H_FRAC * d)
+    xs === nothing && return false
+    xr_old = collect(Float64, alpha_r)
+    yi_old = collect(Float64, alpha_i)
+    global alpha_i = [f_interp(xr_old, yi_old, x) for x in xs]   # exact at old nodes
+    global alpha_r = xs
+    global F = contour_F()
+    load_on_workers()
+    @everywhere begin
+        normals_F = contour_normals(F)
+    end
+    global omega_F = contour_omega_F(F)
+    load_on_workers()
+    return true
+end
+
+# v8: returns the whole sweep (br_try) instead of (au_try, al_try).
+function omega_trial_ok(omega_i_trial)
+    L_try = contour_L_at(omega_i_trial)
+    br_try = contour_alpha_L_conti(L_try)
+    if !all(isfinite, br_try.u) || !all(isfinite, br_try.l) ||
+       !all(isfinite, br_try.pu) || !all(isfinite, br_try.pl)
+        return false, "non-finite branch", L_try, br_try
+    end
+    ok, reason = branch_overlap_valid(br_try.u, br_try.l)
+    return ok, reason, L_try, br_try
+end
+
+function local_contour_distances(F, alpha_L_u, alpha_L_l)
+    all_branches = vcat(alpha_L_u, alpha_L_l)
+    return [minimum(abs.(f .- all_branches)) for f in F]
+end
+
+function contour_distance(F, alpha_L_u, alpha_L_l)
+    return minimum(local_contour_distances(F, alpha_L_u, alpha_L_l))
+end
+
+function nearest_branch_info(f, alpha_L_u, alpha_L_l)
+    all_branches = vcat(alpha_L_u, alpha_L_l)
+    distances = abs.(all_branches .- f)
+    idx = argmin(distances)
+    return all_branches[idx], distances[idx]
+end
+
+function directional_dt_check(F_old, F_trial, alpha_L_u, alpha_L_l;
+                          move_safety = 0.5, global_max_move = 0.02)
+    N = length(F_old)
+    toward_amounts = zeros(Float64, N)
+    local_allowed_toward = zeros(Float64, N)
+    full_moves = abs.(F_trial .- F_old)
+    dt_ok = true
+    for j in 1:N
+        f_old = F_old[j]
+        f_new = F_trial[j]
+        move_vec = f_new - f_old
+        nearest_branch, dist = nearest_branch_info(f_old, alpha_L_u, alpha_L_l)
+        if dist < 1e-12
+            toward_amounts[j] = abs(move_vec)
+            local_allowed_toward[j] = 0.0
+            dt_ok = false
+            continue
+        end
+        direction_to_branch = nearest_branch - f_old
+        unit_to_branch = direction_to_branch / dist
+        toward_amount = real(conj(unit_to_branch) * move_vec)
+        allowed_toward = move_safety * dist
+        toward_amounts[j] = toward_amount
+        local_allowed_toward[j] = allowed_toward
+        if toward_amount > allowed_toward
+            dt_ok = false
+        end
+        if abs(move_vec) > global_max_move
+            dt_ok = false
+        end
+    end
+    return dt_ok, toward_amounts, local_allowed_toward, full_moves
+end
+
+function branch_slowdown_factor(d_branch)
+    d_safe = 0.2      # start slowing below this
+    min_factor = 0.1  # never go below  10% speed
+    return clamp(d_branch / d_safe, min_factor, 1.0)
+end
+function print_iteration_header(k)
+    println()
+    println("====================================================================")
+    println("                      ITERATION k = $k STARTED")
+    println("====================================================================")
+    flush(stdout)
+end
+function print_iteration_footer(k)
+    println("--------------------------------------------------------------------")
+    println("                      ITERATION k = $k FINISHED")
+    println("--------------------------------------------------------------------")
+    println()
+    flush(stdout)
+end
+function print_block(title)
+    println()
+    println("---- $title ----")
+    flush(stdout)
+end
+#
+for k = 1:MAX_STEPS
+    global omega_i, L, alpha_L_u, alpha_L_l, alpha_i, F, omega_F, iteration_step
+    global omega_r, adapt_level, adapt_nogain, adapt_done
+    local dict_to_JSON, current_array
+
+    # v4.7 CHANGE 8: stop on the ABSOLUTE iteration count, not on how many
+    # steps this process happens to have taken.  k still counts steps in this
+    # segment; iteration_step is the number that goes into the log and that
+    # every previous segment also counted in.
+    if iteration_step > ITER_TARGET
+        @printf("TARGET REACHED: next iteration would be %d, ITER_TARGET = %d.  Stopping after %d step(s) this run.\n",
+                iteration_step, ITER_TARGET, k - 1)
+        flush(stdout)
+        break
+    end
+
+    omega_i_old = omega_i
+    omega_status = "none"
+    omega_attempt_used = 0
+    omega_valid_count = 0
+    omega_jump = NaN
+    omega_dt_used = NaN
+
+    alpha_status = "not-run"
+    alpha_attempt_used = 0
+    max_raw_move = NaN
+    max_smooth_move = NaN
+
+    begin
+        # omega_F as it stands NOW, i.e. the one L is about to be placed
+        # against.  Stored in the JSON as "omega_F_at_L".
+        omega_F_at_L = copy(omega_F)
+
+        # v4.6 CHANGE 2: parabolic peak instead of the discrete node maximum.
+        # Falls back to maximum(imag.(omega_F)) whenever the fit is not a clean
+        # interior peak, so OMEGA_LB_PARABOLIC = false reproduces v4.5 exactly.
+        # v8 rev A1: refined along the polyline (>= the v4.6 node parabola).
+        omegaF_max_i, omega_lb_node, omega_lb_alpha_r = omegaF_peak_refined(F, omega_F)
+        omega_clearance = 1e-9
+        omega_lower_bound = omegaF_max_i + omega_clearance
+
+        # ------------------------------------------------------------
+        # REPAIR STEP
+        # ------------------------------------------------------------
+        omega_repaired = false
+        omega_accepted = false
+
+        if omega_i <= omega_lower_bound
+            global omega_i = omega_lower_bound
+            global L = contour_L()
+            load_on_workers()
+            omega_repaired = true
+            omega_accepted = true
+            global delta_t = min(delta_t, 1.5e-3)
+            omega_status = "repaired"
+            omega_jump = abs(omega_i - omega_i_old)
+            omega_dt_used = 0.0
+            omega_valid_count = 0
+        end
+
+        omega_dt = delta_t
+        omega_dt_min = 1e-12
+        min_valid_omega_candidates = 2
+        max_omega_jump_factor = 40.0
+        min_useful_omega_jump = 1e-12
+
+        if !omega_repaired
+            for omega_attempt in 1:50
+                # NOTE (v4.5, unchanged on purpose): omega_i_vectorization is
+                # a constant vector and is never written inside this loop, so
+                # the central difference below is identically zero and the
+                # d_d_omega_r_Phi_L coupling contributes nothing.  That term
+                # is the only place omega_r spacing enters the omega update,
+                # so a non-uniform grid cannot perturb the descent.
+                omega_i_vectorization = fill(omega_i, length(omega_r))
+                omega_i_cache = copy(omega_i_vectorization)
+
+                for j in 2:(length(omega_i_cache) - 1)
+                    omega_i_cache[j] =
+                        omega_i_vectorization[j] +
+                        omega_dt * (
+                            -lambda
+                            + (omega_i_vectorization[j+1] - omega_i_vectorization[j-1]) /
+                            (omega_r[j+1] - omega_r[j-1]) *
+                            d_d_omega_r_Phi_L(L[j])
+                            - d_d_omega_i_Phi_L(L[j])
+                        )
+                end
+
+                omega_i_cache = [isfinite(x) && abs(x) < 10.0 ? x : -Inf for x in omega_i_cache]
+                greater_candidates = filter(x -> isfinite(x) && x > omega_lower_bound &&  abs(x - omega_i) > min_useful_omega_jump, omega_i_cache)
+
+                if length(greater_candidates) >= min_valid_omega_candidates
+                    omega_candidate = minimum(greater_candidates)
+                    omega_jump = abs(omega_candidate - omega_i)
+                    max_allowed_omega_jump = max_omega_jump_factor * omega_dt
+                    if omega_jump <= max_allowed_omega_jump
+                        L_trial = contour_L_at(omega_candidate)
+                        br_trial = contour_alpha_L_conti(L_trial)
+                        overlap_ok, overlap_reason =
+                            branch_overlap_valid(br_trial.u, br_trial.l)
+                        if overlap_ok
+                            global omega_i = omega_candidate
+                            global L = L_trial
+                            set_branches!(br_trial)
+                            omega_accepted = true
+                            omega_status = "accepted"
+                            omega_attempt_used = omega_attempt
+                            omega_valid_count = length(greater_candidates)
+                            omega_dt_used = omega_dt
+                            break
+                        else
+                            @printf(
+                                "[k=%d] omega rejected: branch tracking failed (%s) | reducing dt_omega %.2e -> %.2e\n",
+                                k, overlap_reason, omega_dt, 0.5 * omega_dt)
+                            omega_dt *= 0.5
+                        end
+                    else
+                        @printf(
+                            "[k=%d] omega rejected: jump %.3e > allowed %.3e | reducing dt_omega %.2e -> %.2e\n",
+                            k, omega_jump, max_allowed_omega_jump, omega_dt, 0.5 * omega_dt)
+                        omega_dt *= 0.5
+                    end
+                else
+                    @printf(
+                        "[k=%d] omega rejected: valid/useful=%d < required=%d | lower=%.6e | omega_i=%.6e | reducing dt_omega %.2e -> %.2e\n",
+                        k, length(greater_candidates), min_valid_omega_candidates,
+                        omega_lower_bound, omega_i, omega_dt, 0.5 * omega_dt)
+                    omega_dt *= 0.5
+                end
+
+                if omega_dt < omega_dt_min
+                    @printf("[k=%d] STOP: omega_dt below minimum. No safe omega step found.\n", k)
+                    omega_accepted = false
+                    break
+                end
+            end
+        end
+
+        if !omega_accepted
+            println("No safe omega accepted.")
+            break
+        end
+        if omega_repaired
+            global L = contour_L()
+            load_on_workers()
+            @everywhere begin
+                normals_F = contour_normals(F)
+            end
+            set_branches!(contour_alpha_L_conti(L))
+            load_on_workers()
+        else
+            load_on_workers()
+            @everywhere begin
+                normals_F = contour_normals(F)
+            end
+        end
+
+        # -------------------------------------------------------------------
+        # v4.4 BISECTION ENDGAME (unchanged)
+        # -------------------------------------------------------------------
+        omega_bisect_status = OMEGA_BISECT ? "idle" : "off"
+        omega_bisect_tries  = 0
+        omega_gap_before    = omega_i - omega_lower_bound
+        omega_gap_after     = omega_gap_before
+        omega_wall_reason   = ""
+
+        if OMEGA_BISECT && omega_accepted &&
+           omega_gap_before > OMEGA_GAP_TARGET &&
+           omega_gap_before < OMEGA_BISECT_ENGAGE
+
+            a_lo = omega_lower_bound     # deepest legal height, validity unknown
+            b_hi = omega_i               # current height, known admissible
+
+            best_w  = omega_i
+            best_L  = L
+            best_br = nothing      # v8: set by the first admissible probe
+
+            for probe in 1:OMEGA_BISECT_MAX
+                omega_bisect_tries += 1
+                w_try = (probe == 1) ? a_lo : 0.5 * (a_lo + b_hi)
+                ok, reason, L_try, br_try = omega_trial_ok(w_try)
+                if ok && OMEGA_BISECT_MIN_DFC > 0.0
+                    dfc_try = contour_distance(F, br_try.u, br_try.l)
+                    if !isfinite(dfc_try) || dfc_try < OMEGA_BISECT_MIN_DFC
+                        ok = false
+                        reason = @sprintf("F-branch distance %.3e < %.3e",
+                                          dfc_try, OMEGA_BISECT_MIN_DFC)
+                    end
+                end
+                if ok
+                    best_w, best_L, best_br = w_try, L_try, br_try
+                    b_hi = w_try
+                else
+                    a_lo = w_try
+                    omega_wall_reason = reason
+                end
+                if (best_w - omega_lower_bound) <= OMEGA_GAP_TARGET
+                    omega_bisect_status = "target"
+                    break
+                end
+                if (b_hi - a_lo) < OMEGA_BISECT_TOL
+                    omega_bisect_status = "wall"
+                    break
+                end
+                omega_bisect_status = "budget"
+            end
+
+            if best_w < omega_i      # implies best_br !== nothing
+                global omega_i   = best_w
+                global L         = best_L
+                set_branches!(best_br)
+                load_on_workers()
+                omega_jump = abs(omega_i - omega_i_old)
+                omega_status = omega_status * "+bisect"
+            end
+
+            omega_gap_after = omega_i - omega_lower_bound
+
+            if omega_bisect_status != "target"
+                @printf(
+                    "[k=%d] bisect %s after %d probes: gap %.3e -> %.3e | dFC=%.3e | wall: %s\n",
+                    k, omega_bisect_status, omega_bisect_tries,
+                    omega_gap_before, omega_gap_after,
+                    contour_distance(F, alpha_L_u, alpha_L_l),
+                    isempty(omega_wall_reason) ? "-" : omega_wall_reason)
+                flush(stdout)
+            end
+        end
+                    #
+        alpha_i_cache = copy(alpha_i)
+
+        # v8: the gap as a function of omega_r comes from the per-omega
+        # pairs (alpha_L_u / alpha_L_l are frontiers, not indexed by L).
+        # d_branch_front is the set distance between the two frontiers.
+        d_vec     = pair_gap(pair_u, pair_l)
+        i_pinch   = argmin(d_vec)
+        d_branch  = d_vec[i_pinch]
+        d_branch_front = branch_distance(alpha_L_u, alpha_L_l)
+        h_local   = local_h(omega_r, i_pinch)
+        d_contour = contour_distance(F, alpha_L_u, alpha_L_l)
+
+        # v4.6: pinch location from the d^4 parabola, and the share of d_branch
+        # that the omega_r miss accounts for.  Computed here so it lands in the
+        # JSON for every iteration; the adaptive block at the end of the
+        # iteration reuses these, it does not refit.
+        #   grid_share -> 1   : the grid is what limits d_branch
+        #   grid_share << 1   : omega_i is still above the pinch
+        w_pr_fit, w2_fit = pinch_fit(omega_r, d_vec, i_pinch)
+        pinch_miss = abs(omega_r[i_pinch] - w_pr_fit)
+        d_horiz    = (isfinite(pinch_miss) && isfinite(w2_fit) && w2_fit > 0) ?
+                     2 * sqrt(2 * pinch_miss / w2_fit) : NaN
+        grid_share = (isfinite(d_horiz) && d_branch > 0) ? d_horiz / d_branch : NaN
+        dist_u = minimum(minimum(abs.(f .- alpha_L_u)) for f in F)
+        dist_l = minimum(minimum(abs.(f .- alpha_L_l)) for f in F)
+
+        # ---------------------------------------------------------------
+        # v4.7 CHANGE 5: retune the repulsion range to the gap F now has to
+        # thread.  Placed here, after d_branch and dist_u/dist_l exist and
+        # before the alpha update that is the only consumer of zeta_alpha.
+        # exp_arg is the largest exponent phi_F will see this iteration --
+        # the direct saturation monitor.  Watch it stay well under
+        # EXP_ARG_MAX = 400; in v4.6 it went past 400 on 26 of the last 156
+        # iterations.
+        # ---------------------------------------------------------------
+        zeta_push_d!(d_branch)
+        global zeta_alpha = zeta_step(zeta_alpha)
+        r_min   = min(dist_u, dist_l)
+        exp_arg = zeta_alpha / (r_min^2 + epsilon)
+
+        branch_factor = branch_slowdown_factor(d_branch)
+        local_delta_t = delta_t * branch_factor
+
+        dt_min = 1e-10
+        dt_max = 2e-2
+        dt_start = min(delta_t, dt_max)
+
+        if d_contour > 0.01
+            move_safety = 2.0
+        elseif d_contour > 0.003
+            move_safety = 1.2
+        else
+            move_safety = 0.8
+        end
+
+        global_max_move = 0.20
+        stop_after_save = false
+        stop_reason = ""
+
+        if !isfinite(d_branch) || !isfinite(d_contour)
+            @printf("[k=%d] STOP: non-finite distance | d_branch=%.3e | d_contour=%.3e\n",
+                    k, d_branch, d_contour)
+            break
+        end
+
+        if d_branch < PINCH_TOL
+            stop_after_save = true
+            stop_reason = "pinch tolerance reached"
+        end
+
+        # v7.2: branches vs the F that L was just placed against.  On a hit
+        # the alpha update below is skipped, so the logged frame shows F
+        # together with the branch that crossed it.
+        # rev B STEP 0: REPORT ONLY.  This transient appears at k = 5-6 in every
+        # earlier run and the next F step clears it.  Logged as side_om_*.
+        side_stage = "omega"
+        sc = side_check(F, alpha_L_u, alpha_L_l)
+        sc_om = sc
+        side_hit = false
+        if sc.hit
+            side_report(k, side_stage, sc, L, alpha_L_u, alpha_L_l)
+        end
+
+    n_sigma_cap = 0   # rev B: defined before the block that sets it
+    if !side_hit   # v7.2: alpha update (unindented, unchanged from v7.1)
+    accepted = false
+    alpha_i_cache = copy(alpha_i)
+    alpha_i_smooth = copy(alpha_i)
+
+    n_sigma_cap = 0
+    for attempt in 1:5
+        alpha_i_trial = copy(alpha_i)
+        n_sigma_cap = 0
+        for j in 2:(length(alpha_i_trial) - 1)
+            hp_j = alpha_r[j+1] - alpha_r[j]
+            hm_j = alpha_r[j] - alpha_r[j-1]
+            if abs(hp_j - hm_j) <= F_UNIFORM_RTOL * max(hp_j, hm_j)
+                # equal cells: the original expressions, untouched
+                alpha_i_r =
+                    (alpha_i[j+1] - alpha_i[j-1]) /
+                    (alpha_r[j+1] - alpha_r[j-1])
+                alpha_i_rr =
+                    (alpha_i[j+1] - 2.0 * alpha_i[j] + alpha_i[j-1]) /
+                    ((alpha_r[j+1] - alpha_r[j]) * (alpha_r[j] - alpha_r[j-1]))
+            else
+                # rev B STEP 1: second-order unequal-spacing stencils (v5 CHANGE 13)
+                alpha_i_r =
+                    (-hp_j / (hm_j * (hp_j + hm_j))) * alpha_i[j-1] +
+                    ((hp_j - hm_j) / (hp_j * hm_j))  * alpha_i[j]   +
+                    ( hm_j / (hp_j * (hp_j + hm_j))) * alpha_i[j+1]
+                alpha_i_rr =
+                    2.0 * ((alpha_i[j+1] - alpha_i[j]) / hp_j -
+                           (alpha_i[j] - alpha_i[j-1]) / hm_j) / (hp_j + hm_j)
+            end
+            # rev B STEP 1: explicit-diffusion stability cap (no-op on the uniform grid)
+            sigma_cap = SIGMA_CFL * hp_j * hm_j / local_delta_t
+            sigma_j = sigma
+            if sigma_cap < sigma
+                sigma_j = sigma_cap
+                n_sigma_cap += 1
+            end
+            rhs_j =
+                (
+                    alpha_i_r * d_d_alpha_r_Phi_F(F[j])
+                    - d_d_alpha_i_Phi_F(F[j])
+                    + sigma_j * alpha_i_rr
+                ) / (1.0 + alpha_i_r^2)
+            rhs_cap = 100.0
+            rhs_j = isnan(rhs_j) ? 0.0 : clamp(rhs_j, -rhs_cap, rhs_cap)
+            alpha_i_trial[j] = alpha_i[j] + local_delta_t * rhs_j
+        end
+        alpha_i_trial[1] = alpha_i_trial[2]
+        alpha_i_trial[end] = alpha_i_trial[end-1]
+        alpha_i_smooth = rolling_average_filter(alpha_i_trial, 7)
+        alpha_i_smooth[1] = alpha_i_smooth[2]
+        alpha_i_smooth[end] = alpha_i_smooth[end-1]
+        factor = acceptance_factor.(F, Ref(alpha_L_u), Ref(alpha_L_l))
+        move_raw = abs.(alpha_i_trial .- alpha_i)
+        move_smooth = abs.(alpha_i_smooth .- alpha_i)
+        if all(move_raw .<= factor .* max.(abs.(alpha_i), 1e-12))
+            alpha_i_cache = copy(alpha_i_trial)
+            accepted = true
+            alpha_status = "accepted"
+            alpha_attempt_used = attempt
+            max_raw_move = maximum(move_raw)
+            max_smooth_move = maximum(move_smooth)
+            break
+        else
+            local_delta_t *= 0.5
+            alpha_status = "smoothed/reduced"
+            alpha_attempt_used = attempt
+            max_raw_move = maximum(move_raw)
+            max_smooth_move = maximum(move_smooth)
+        end
+    end
+
+        if all(isfinite, alpha_i_smooth)
+            global alpha_i = copy(alpha_i_smooth)
+        else
+            @printf("[k=%d] WARNING: alpha update produced %d non-finite values; step discarded\n",
+                    k, count(!isfinite, alpha_i_smooth))
+            flush(stdout)
+        end
+        global F = contour_F()
+        load_on_workers()
+        global omega_F = contour_omega_F(F)
+
+        # v7.2: the moved F against the current branches.
+        side_stage = "alpha"
+        sc = side_check(F, alpha_L_u, alpha_L_l)
+        global side_run = sc.hit ? side_run + 1 : 0
+        if sc.hit
+            side_report(k, side_stage, sc, L, alpha_L_u, alpha_L_l)
+        end
+        if SIDE_STOP && sc.hit && side_run >= SIDE_STOP_RUN
+            side_hit = true
+            stop_after_save = true
+            stop_reason = @sprintf("branch on the wrong side of F after the F step (%d consecutive)", side_run)
+        end
+    end   # v7.2: if !side_hit
+
+        # -------------------------------------------------------------------
+        # rev B STEP 2: graded F.  The throat is the midpoint of the tracked
+        # pair at the argmin -- the run's own estimate.  Trigger and guard
+        # are the same test (v6.3), so nothing is asked for that would be
+        # refused.  Runs after the side check: a regrid does not move F, so
+        # that check is still valid for the regridded F.
+        # -------------------------------------------------------------------
+        f_regrid_now = false
+        throat_r     = real(0.5 * (pair_u[i_pinch] + pair_l[i_pinch]))   # v8: the pair, not the frontier
+        h_throat     = (alpha_r[1] < throat_r < alpha_r[end]) ?
+                       local_h(alpha_r, argmin(abs.(alpha_r .- throat_r))) : NaN
+        regrid_gain  = (isfinite(h_throat) && h_throat > 0 && d_branch > 0) ?
+                       (F_H_FRAC * d_branch) / h_throat : NaN
+        if F_REGRID && !stop_after_save && isfinite(regrid_gain)
+            if regrid_gain < REGRID_GAIN
+                global f_coarse_run += 1
+            else
+                global f_coarse_run = 0
+            end
+            if f_coarse_run >= F_HOLD
+                global f_coarse_run = 0
+                n_old = length(alpha_r)
+                if regrid_F!(throat_r, d_branch)
+                    f_regrid_now = true
+                    global f_regrid_count += 1
+                    h_throat = local_h(alpha_r, argmin(abs.(alpha_r .- throat_r)))
+                    @printf("[k=%d] F REGRID #%d: N_F %d -> %d, h at throat %.3e (target %.3e = %.2f d), alpha_r = %.6f, d = %.3e\n",
+                            k, f_regrid_count, n_old, length(alpha_r), h_throat,
+                            F_H_FRAC * d_branch, F_H_FRAC, throat_r, d_branch)
+                else
+                    @printf("[k=%d] F regrid refused (budget %d or no gain): N_F = %d, h at throat %.3e, target %.3e\n",
+                            k, F_MAX_POINTS, length(alpha_r), h_throat, F_H_FRAC * d_branch)
+                end
+                flush(stdout)
+            end
+        end
+        @printf(
+            "[%04d] jump=%9.3e | dUL=%9.3e dFr=%9.3e | dUF=%9.3e | dLF=%9.3e | dt=%9.3e | z=%9.3e xarg=%8.1f | gap=%9.3e (%s,%d) | NL=%3d L%d h=%8.2e gs=%5.2f miss=%8.2e | jmpU=%6.3f fr=%3d/%3d fb=%d | sU=%9.2e sL=%9.2e | NF=%3d h/d=%5.3f | dLB=%8.2e | %s/%s\n",
+            k, omega_jump, d_branch, d_branch_front, dist_u, dist_l, local_delta_t, zeta_alpha, exp_arg,
+            omega_gap_after, omega_bisect_status, omega_bisect_tries,
+            length(omega_r), adapt_level, h_local, grid_share, pinch_miss,
+            track_jump_u, length(alpha_L_u), length(alpha_L_l), pair_fallback, sc.gap_u, sc.gap_l,
+            length(alpha_r), isfinite(h_throat) ? h_throat / d_branch : NaN,
+            omegaF_max_i - omega_lb_node,
+            omega_status, alpha_status)
+        flush(stdout)
+        load_on_workers()
+        local dict_to_JSON = Dict(
+            "iteration" => iteration_step,
+            "L" => complexvec_to_json(L),
+            "alpha_L_u" => complexvec_to_json(alpha_L_u),
+            "alpha_L_l" => complexvec_to_json(alpha_L_l),
+            "F" => complexvec_to_json(F),
+            "omega_F" => complexvec_to_json(omega_F),
+            "omega_F_at_L" => complexvec_to_json(omega_F_at_L),
+            "omega_gap" => omega_gap_after,
+            "omega_bisect_status" => omega_bisect_status,
+            "omega_bisect_tries" => omega_bisect_tries,
+            "d_branch" => d_branch,
+            "d_contour" => d_contour,
+            "n_L" => length(L),
+            "adapt_level" => adapt_level,
+            "h_local" => h_local,
+            # v4.6 diagnostics
+            "omega_pr_fit" => jsonnum(w_pr_fit),
+            "omega2_fit"   => jsonnum(w2_fit),
+            "pinch_miss"   => jsonnum(pinch_miss),
+            "grid_share"   => jsonnum(grid_share),
+            # v4.7 diagnostics
+            "zeta_alpha"   => jsonnum(zeta_alpha),
+            "zeta_d_med"   => jsonnum(length(zeta_hist_d) < ZETA_WINDOW ?
+                                      NaN : median(zeta_hist_d)),
+            "exp_arg_max"  => jsonnum(exp_arg),
+            "dist_u"       => jsonnum(dist_u),
+            "dist_l"       => jsonnum(dist_l),
+            # v4.7 CHANGE 9 keys.  v8: there is no continuity guard, so
+            # track_overrides is always 0.  track_jump_u/l is the largest
+            # step between neighbouring FRONTIER points (ordered by s), of
+            # the accepted sweep.  A large value now means a gap in the
+            # frontier (or a connecting segment between two modes), not a
+            # tracking switch.
+            "track_overrides" => track_overrides,
+            "track_jump_u"    => jsonnum(track_jump_u),
+            "track_jump_l"    => jsonnum(track_jump_l),
+            # v7.2 side test (see side_check), from the last stage that ran:
+            # side_gap_u/l > 0 means the branch is on its own side of F.
+            "side_stage"  => side_stage,
+            "side_gap_u"  => jsonnum(sc.gap_u),
+            "side_gap_l"  => jsonnum(sc.gap_l),
+            "side_bad_u"  => sc.bad_u,
+            "side_bad_l"  => sc.bad_l,
+            "side_out"    => sc.n_out,
+            "side_hit"    => sc.hit,
+            # rev B
+            "side_om_gap_u" => jsonnum(sc_om.gap_u),
+            "side_om_gap_l" => jsonnum(sc_om.gap_l),
+            "side_om_hit"   => sc_om.hit,
+            "side_run"      => side_run,
+            "n_F"           => length(F),
+            "h_throat"      => jsonnum(h_throat),
+            "throat_r"      => jsonnum(throat_r),
+            "regrid_gain"   => jsonnum(regrid_gain),
+            "f_coarse_run"  => f_coarse_run,
+            "f_regrid"      => f_regrid_now,
+            "n_sigma_cap"   => n_sigma_cap,
+            # v8 rev A1: omega lower bound, refined vs node parabola
+            "omega_lb_refined" => jsonnum(omegaF_max_i),
+            "omega_lb_node"    => jsonnum(omega_lb_node),
+            "omega_lb_alpha_r" => jsonnum(omega_lb_alpha_r),
+            # v8 point cloud.  pair_u/l: per-omega pairs on L (d_vec is
+            # |pair_u - pair_l|).  d_branch_front: set distance between the
+            # frontiers.  cloud_n_*: filtered cloud sizes.  front_n_*:
+            # frontier lengths.  pair_fallback: pairs taken unfiltered.
+            "pair_u"         => complexvec_to_json(pair_u),
+            "pair_l"         => complexvec_to_json(pair_l),
+            "d_branch_front" => jsonnum(d_branch_front),
+            "cloud_n_u"      => length(cloud_u),
+            "cloud_n_l"      => length(cloud_l),
+            # v8: the filtered clouds of the accepted sweep (for plotting).
+            # Empty on the first frame after a checkpoint resume.
+            "cloud_u"        => complexvec_to_json(cloud_u),
+            "cloud_l"        => complexvec_to_json(cloud_l),
+            "front_n_u"      => length(alpha_L_u),
+            "front_n_l"      => length(alpha_L_l),
+            "pair_fallback"  => pair_fallback,
+        )
+        # v4.7 CHANGE 8: stamp the first entry after a resume, so a join is
+        # visible in the data instead of having to be remembered.  Any
+        # discontinuity at a join is then attributable rather than mysterious.
+        if iteration_step == resume_join_at
+            dict_to_JSON["resumed"] = true
+        end
+        # v7.1: append one line (no read-rewrite), and always keep the frame
+        # the run stops on.
+        if LOG_EVERY <= 1 || iteration_step % LOG_EVERY == 0 ||
+           iteration_step == resume_join_at || iteration_step >= ITER_TARGET ||
+           stop_after_save
+            append_log(filename, dict_to_JSON)
+        end
+        global iteration_step += 1
+
+        if stop_after_save
+            write_checkpoint!()
+            @printf(
+                "[k=%d] STOP AFTER SAVE: %s | d_branch=%.3e | d_contour=%.3e | omega_i=%.6e\n",
+                k, stop_reason, d_branch, d_contour, omega_i)
+            flush(stdout)
+            break
+        end
+
+        # -------------------------------------------------------------------
+        # v4.5 ADAPTIVE L REFINEMENT
+        #
+        # Placed at the very end of the iteration, AFTER the JSON save, so the
+        # stored entry always describes the grid its numbers were computed on
+        # and the next iteration simply starts on the finer grid.
+        # -------------------------------------------------------------------
+        if ADAPT_ON && !adapt_done
+            adapt_push!(i_pinch, d_branch, omega_r[i_pinch], h_local)
+
+            if adapt_stalled()
+                if adapt_level >= ADAPT_MAX_LEVEL
+                    @printf("[k=%d] ADAPT OFF: level cap %d reached | d_branch=%.4e\n",
+                            k, ADAPT_MAX_LEVEL, d_branch)
+                    flush(stdout)
+                    global adapt_done = true
+                elseif d_branch <= ADAPT_D_FLOOR
+                    @printf("[k=%d] ADAPT OFF: d_branch=%.4e is at or below the noise floor %.1e\n",
+                            k, d_branch, ADAPT_D_FLOOR)
+                    flush(stdout)
+                    global adapt_done = true
+                elseif i_pinch <= 1 || i_pinch >= length(omega_r)
+                    @printf("[k=%d] adapt: argmin is at a grid endpoint (i=%d) -- not refining\n",
+                            k, i_pinch)
+                    flush(stdout)
+                    adapt_reset_history!()
+                else
+                    h_new = h_local / ADAPT_FACTOR
+                    n_add = 2 * ADAPT_HALF_CELLS * (ADAPT_FACTOR - 1)
+                    if h_new < ADAPT_MIN_H
+                        @printf("[k=%d] ADAPT OFF: spacing floor reached (h=%.2e)\n", k, h_local)
+                        flush(stdout)
+                        global adapt_done = true
+                    elseif length(omega_r) + n_add > ADAPT_MAX_POINTS
+                        @printf("[k=%d] ADAPT OFF: point budget reached (N_L=%d)\n", k, length(omega_r))
+                        flush(stdout)
+                        global adapt_done = true
+                    else
+                        w2   = omega2_estimate(omega_r, d_vec, i_pinch)
+                        dpre = adapt_predicted_d(h_new, w2)
+                        n_before = length(omega_r)
+                        w_lo = omega_r[max(1, i_pinch - ADAPT_HALF_CELLS)]
+                        w_hi = omega_r[min(n_before, i_pinch + ADAPT_HALF_CELLS)]
+
+                        # ----------------------------------------------------
+                        # v4.6 CHANGES 1 and 4.  w_pr_fit / pinch_miss /
+                        # grid_share were computed with d_vec earlier in this
+                        # iteration and stored in the JSON entry above.
+                        #   (a) grid_share says whether this round is even
+                        #       about the grid  -> CHANGE 1, the score gate.
+                        #   (b) w_pr_fit says where the new nodes belong
+                        #                       -> CHANGE 4, vertex placement.
+                        # ----------------------------------------------------
+                        grid_limited = !ADAPT_SCORE_GATE ||
+                                       (isfinite(grid_share) &&
+                                        grid_share >= ADAPT_GRID_SHARE &&
+                                        grid_share <= ADAPT_GRID_SHARE_MAX)
+                        h_cluster = max(h_new, 2 * pinch_miss)
+                        vertex_ok = ADAPT_VERTEX_PLACE && isfinite(w_pr_fit) &&
+                                    isfinite(pinch_miss) &&
+                                    pinch_miss <= ADAPT_VERTEX_MAXMOVE * h_local
+
+                        placement = "subdivide"
+                        h_placed  = h_new
+                        if vertex_ok
+                            omega_r_try = insert_cluster(omega_r, w_pr_fit, h_cluster)
+                            if length(omega_r_try) > n_before
+                                global omega_r = omega_r_try
+                                placement = "cluster"
+                                h_placed  = h_cluster
+                            else
+                                # every new node collided with an existing one
+                                global omega_r = refine_omega_r(omega_r, i_pinch)
+                            end
+                        else
+                            global omega_r = refine_omega_r(omega_r, i_pinch)
+                        end
+                        global adapt_level += 1
+                        push_omega_r()
+                        global L = contour_L()
+                        load_on_workers()
+                        # F was replaced a few lines above (contour_F after the
+                        # alpha update) but normals_F still belongs to the OLD
+                        # F -- in v4.4 nothing re-tracked after that point so it
+                        # never mattered.  spatial_payload takes both from the
+                        # main process, so they have to agree before the
+                        # re-track, or the side classification uses one F's
+                        # points with another F's normals.
+                        @everywhere begin
+                            normals_F = contour_normals(F)
+                        end
+                        set_branches!(contour_alpha_L_conti(L))
+                        load_on_workers()
+                        adapt_reset_history!()
+
+                        # v8: same measure as d_branch (per-omega pairs),
+                        # so the gain compares like with like.
+                        d_after = minimum(pair_gap(pair_u, pair_l))
+                        gain    = d_branch > 0 ? d_after / d_branch : NaN
+                        @printf(
+                            "[k=%d] ADAPT -> level %d (%s) | window [%.9f, %.9f] | h %.3e -> %.3e | N_L %d -> %d | |w''| arms~%.4f fit~%.4f | vertex %.9f (miss %.3e, %.0f %% of d) | d %.4e -> %.4e (gain %.3f, predicted %.4e)\n",
+                            k, adapt_level, placement, w_lo, w_hi, h_local, h_placed,
+                            n_before, length(omega_r), w2, w2_fit, w_pr_fit, pinch_miss,
+                            100 * grid_share, d_branch, d_after, gain, dpre)
+                        flush(stdout)
+
+                        # A round that buys nothing means the grid is no longer
+                        # what limits d_min -- from here it is the omega_i error
+                        # (i.e. F's resolution near alpha_p) or the noise floor.
+                        # Two in a row, because one can be bad luck in where the
+                        # new points land.
+                        #
+                        # v4.6 CHANGE 1: only score the round when the grid is
+                        # what is being judged.  While omega_i is still above
+                        # the pinch, d_branch is set by the vertical offset and
+                        # the gain is capped near 1 whatever the grid does --
+                        # that is what killed v4.5 at k = 227.
+                        if !grid_limited
+                            gate_reason = !isfinite(grid_share) ? "the d^4 fit failed" :
+                                          grid_share > ADAPT_GRID_SHARE_MAX ?
+                                             "the d^4 fit has degenerated (|w''| unusable)" :
+                                             "omega_i is still the limiter"
+                            @printf("[k=%d] adapt: round NOT scored -- horizontal miss explains %.0f %% of d_branch, outside [%.0f, %.0f] %%: %s | adapt_nogain stays %d\n",
+                                    k, 100 * grid_share, 100 * ADAPT_GRID_SHARE,
+                                    100 * ADAPT_GRID_SHARE_MAX, gate_reason, adapt_nogain)
+                            flush(stdout)
+                        elseif isfinite(gain) && gain > ADAPT_MIN_GAIN
+                            global adapt_nogain += 1
+                        else
+                            global adapt_nogain = 0
+                        end
+                        if adapt_nogain >= ADAPT_NOGAIN_MAX
+                            @printf("[k=%d] ADAPT OFF: %d refinements in a row gained less than %.0f%% -- the L grid is no longer the limiter (look at omega_i / F resolution / zeta next) | d_branch=%.4e\n",
+                                    k, adapt_nogain, 100 * (1 - ADAPT_MIN_GAIN), d_after)
+                            flush(stdout)
+                            global adapt_done = true
+                        end
+                    end
+                end
+            end
+        end
+
+        # -------------------------------------------------------------------
+        # v4.7 CHANGE 8: CHECKPOINT.  The last statement of the iteration, on
+        # purpose.  The JSON entry above was written BEFORE the refinement
+        # block, so it still describes the pre-refinement grid; this describes
+        # the state iteration `iteration_step` will actually start from.
+        # Resuming from the log instead would silently throw away the last
+        # refinement round and then be unable to re-earn it for
+        # ADAPT_STALL_WINDOW iterations.
+        # -------------------------------------------------------------------
+        if CKPT_EVERY > 0 && k % CKPT_EVERY == 0
+            write_checkpoint!()
+        end
+    end
+end
+
+##############
+# READING IN #
+##############
+begin
+    function json_to_complexvec(arr)
+        return ComplexF64[complex(x["re"], x["im"]) for x in arr]
+    end
+    function load_step(filename; offset=0)
+        data, _ = read_log(filename)
+        n = length(data)
+        idx = n + offset
+        entry = data[idx]
+        iteration_step = entry["iteration"]
+        L = json_to_complexvec(entry["L"])
+        alpha_L_u = json_to_complexvec(entry["alpha_L_u"])
+        alpha_L_l = json_to_complexvec(entry["alpha_L_l"])
+        F = json_to_complexvec(entry["F"])
+        omega_F = json_to_complexvec(entry["omega_F"])
+        return iteration_step, L, alpha_L_u, alpha_L_l, F, omega_F
+    end
+end
+# v4.7 CHANGE 8: this block runs AFTER the loop and OVERWRITES the live
+# globals with the last logged entry.  That is harmless at the end of a batch
+# run, but it would make a manual write_checkpoint!() from the REPL store a
+# state one refinement behind the one the run actually ended on.  Off by
+# default; set POSTLOAD_AFTER_RUN = true to get the old interactive behaviour.
+const POSTLOAD_AFTER_RUN = false
+if POSTLOAD_AFTER_RUN && isfile(filename)
+    iteration_step, L, alpha_L_u, alpha_L_l, F, omega_F = load_step(filename; offset=0)
+    println("Loaded iteration: ", iteration_step)
+    # v8: the per-omega pairs, if the entry has them
+    let e_last = read_log(filename)[1][end]
+        if get(e_last, "pair_u", nothing) isa AbstractVector &&
+           get(e_last, "pair_l", nothing) isa AbstractVector
+            global pair_u = json_to_complexvec(e_last["pair_u"])
+            global pair_l = json_to_complexvec(e_last["pair_l"])
+        end
+    end
+    global omega_i = imag(L[1])
+    global alpha_i = imag.(F)
+    # v4.5: the grid comes back from the stored L, not from the constant.
+    global omega_r = real.(L)
+    push_omega_r()
+    load_on_workers()
+end
+#plot_omega()
+#plot_alpha()
+
+# ---------------------------------------------------------------------------
+# v4.7 CHANGE 8: EQUIVALENCE TEST for the checkpoint.
+#
+# A resumed run is only the same object as a continuous one if the checkpoint
+# carries ALL the state.  The way to know rather than hope:
+#
+#   1.  RESUME = false, ITER_TARGET = 60.  Run.  Keep the log as run_A.json.
+#   2.  RESUME = false, ITER_TARGET = 30.  Run.
+#   3.  RESUME = true,  ITER_TARGET = 60.  Run again -- it resumes at 31.
+#       Keep the log as run_B.json.
+#   4.  compare_runs("run_A.json", "run_B.json")
+#
+# A complete checkpoint gives max|A-B| = 0.0 on every field, because nothing in
+# this code is stochastic and the arithmetic is identical.  Anything non-zero
+# names the first iteration that diverges and the field that did it, which is
+# the piece of state the checkpoint is still missing.  Do this once after any
+# change to what the iteration carries across k.
+# ---------------------------------------------------------------------------
+# JSON.jl stores non-finite numbers as null; read defensively so a diagnostic
+# never throws on a damaged run.  A NaN in the report is itself the signal.
+ckpt_num(x) = x isa Number ? Float64(x) : NaN
+
+function compare_runs(file_a, file_b)
+    a, _ = read_log(file_a)
+    b, _ = read_log(file_b)
+    n = min(length(a), length(b))
+    @printf("compare_runs: %d vs %d entries, comparing the first %d\n",
+            length(a), length(b), n)
+    scalar_fields = ["d_branch", "d_contour", "omega_gap", "zeta_alpha",
+                     "zeta_d_med", "exp_arg_max", "dist_u", "dist_l",
+                     "h_local", "pinch_miss", "grid_share", "omega_pr_fit",
+                     "omega2_fit", "n_L", "adapt_level", "d_branch_front"]
+    vec_fields = ["L", "alpha_L_u", "alpha_L_l", "F", "omega_F", "omega_F_at_L",
+                  "pair_u", "pair_l"]
+    worst = Dict{String,Float64}()
+    first_bad = 0
+    first_bad_field = ""
+    for j in 1:n
+        ea = a[j]
+        eb = b[j]
+        it = get(ea, "iteration", j)
+        for f in scalar_fields
+            xa = get(ea, f, nothing)
+            xb = get(eb, f, nothing)
+            (xa isa Number && xb isa Number) || continue
+            d = abs(Float64(xa) - Float64(xb))
+            worst[f] = max(get(worst, f, 0.0), d)
+            if d > 0 && first_bad == 0
+                first_bad = it
+                first_bad_field = f
+            end
+        end
+        for f in vec_fields
+            va = get(ea, f, nothing)
+            vb = get(eb, f, nothing)
+            (va isa AbstractVector && vb isa AbstractVector) || continue
+            if length(va) != length(vb)
+                worst[f] = Inf
+                if first_bad == 0
+                    first_bad = it
+                    first_bad_field = f * " (length)"
+                end
+                continue
+            end
+            d = 0.0
+            for i in eachindex(va)
+                d = max(d, abs(complex(ckpt_num(va[i]["re"]), ckpt_num(va[i]["im"])) -
+                               complex(ckpt_num(vb[i]["re"]), ckpt_num(vb[i]["im"]))))
+            end
+            worst[f] = max(get(worst, f, 0.0), d)
+            if d > 0 && first_bad == 0
+                first_bad = it
+                first_bad_field = f
+            end
+        end
+    end
+    for f in sort(collect(keys(worst)))
+        @printf("  %-14s max|A-B| = %.6e\n", f, worst[f])
+    end
+    if first_bad == 0
+        println("  IDENTICAL over the compared range -- the checkpoint is complete.")
+    else
+        @printf("  FIRST DIVERGENCE at iteration %d, field %s -- state is missing from the checkpoint.\n",
+                first_bad, first_bad_field)
+    end
+    flush(stdout)
+    return worst
+end
+function truncate_json!(filename; offset=0)
+    data, _ = read_log(filename)
+    n = length(data)
+    idx = n + offset
+    truncated = data[1:idx]
+    # v4.7 CHANGE 8: atomic, like every other write to this file.
+    # v7.1: keep the file's own format (.json array or .jsonl lines).
+    if lowercase(splitext(filename)[2]) == ".json"
+        atomic_write(filename, JSON.json(truncated))
+    else
+        atomic_write(filename, log_lines(truncated))
+    end
+    println("Truncated JSON to step with iteration=", truncated[end]["iteration"], " (kept $idx entries).")
+end
+
+#truncate_json!("contour_iteration.json"; offset=-1)
+load_on_workers()
+#plot_alpha()

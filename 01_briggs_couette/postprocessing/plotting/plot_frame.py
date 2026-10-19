@@ -8,8 +8,8 @@ import matplotlib.pyplot as plt
 
 # ----------------------------------------------------------------- settings --
 HERE = Path(__file__).resolve().parent
-JSON_FILE = HERE.parent.parent / "results" / "json" / "contour_iteration_v7.1.jsonl"
-ITERATION = 400    # None = last entry in the file; or a number
+JSON_FILE = HERE.parent.parent / "results" / "json" / "contour_iteration_v8.jsonl"
+ITERATION = 140    # None = last entry in the file; or a number
 POINTS = True         # draw the discrete sample points
 MARKEVERY = 1         # show every n-th point
 ZOOM_PAD = 6          # close-up half-width, in units of the gap
